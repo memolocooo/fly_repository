@@ -14,12 +14,8 @@ import psycopg2
 from psycopg2.extras import execute_values
 from amazon_api import fetch_orders_from_amazon, request_settlement_report, download_report, get_report_status, process_settlement_report   # Adjust module name if needed
 
-
 # Load environment variables
 load_dotenv()
-
-
-
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -40,7 +36,6 @@ redis_client = redis.StrictRedis.from_url(REDIS_URL, decode_responses=True)
 db.init_app(app)
 migrate = Migrate(app, db)
 
-
 # Amazon OAuth Variables
 LWA_APP_ID = os.getenv("LWA_APP_ID")
 LWA_CLIENT_SECRET = os.getenv("LWA_CLIENT_SECRET")
@@ -58,9 +53,7 @@ try:
 except Exception as e:
     print(f"❌ Database connection failed: {e}")
 
-
 one_year_ago = datetime.utcnow() - timedelta(days=365)
-
 
 def refresh_access_token(selling_partner_id):
     token_entry = AmazonOAuthTokens.query.filter_by(selling_partner_id=selling_partner_id).first()
@@ -85,7 +78,6 @@ def refresh_access_token(selling_partner_id):
 
     print("❌ Failed to refresh token:", data)
     return None
- 
 
 def exchange_auth_code_for_tokens(auth_code):
     """Exchanges auth code for access & refresh tokens from Amazon SP-API."""
@@ -104,26 +96,6 @@ def exchange_auth_code_for_tokens(auth_code):
     else:
         print(f"❌ Error fetching tokens: {response.text}")
         return None
-
-def exchange_auth_code_for_tokens(auth_code):
-    """Exchanges auth code for access & refresh tokens from Amazon SP-API."""
-    payload = {
-        "grant_type": "authorization_code",
-        "code": auth_code,
-        "client_id": LWA_APP_ID,
-        "client_secret": LWA_CLIENT_SECRET,
-        "redirect_uri": os.getenv("REDIRECT_URI"),
-    }
-    
-    response = requests.post(TOKEN_URL, data=payload)
-    
-    if response.status_code == 200:
-        return response.json()
-    else:
-        print(f"❌ Error fetching tokens: {response.text}")
-        return None
-    
-
 
 def get_stored_tokens(selling_partner_id):
     token_entry = AmazonOAuthTokens.query.filter_by(selling_partner_id=selling_partner_id).first()
@@ -135,7 +107,6 @@ def get_stored_tokens(selling_partner_id):
         return refresh_access_token(selling_partner_id)
 
     return token_entry.access_token
-
 
 def save_oauth_tokens(selling_partner_id, access_token, refresh_token, expires_in):
     try:
@@ -186,8 +157,6 @@ def save_oauth_tokens(selling_partner_id, access_token, refresh_token, expires_i
         if conn:
             conn.close()
 
-
-
 def store_orders_in_db(selling_partner_id, orders):
     """Save only necessary Amazon order fields into PostgreSQL."""
     for order in orders:
@@ -222,11 +191,6 @@ def store_orders_in_db(selling_partner_id, orders):
     db.session.commit()
     print(f"✅ {len(orders)} orders saved to database.")
 
-
-
-
-
-
 @app.route('/start-oauth')
 def start_oauth():
     """Redirects user to Amazon for OAuth authentication."""
@@ -243,7 +207,6 @@ def start_oauth():
 
     print(f"🔗 OAuth Redirect URL: {oauth_url}")
     return redirect(oauth_url)
-
 
 @app.route('/callback')
 def callback():
@@ -272,9 +235,6 @@ def callback():
         )
         return redirect(f"https://guillermos-amazing-site-b0c75a.webflow.io/dashboard")
     return jsonify({"error": "Failed to obtain tokens", "details": token_data}), 400
-
-
-
 
 @app.route("/get-orders", methods=["GET"])
 def get_orders():
@@ -319,9 +279,6 @@ def get_orders():
     redis_client.setex(cache_key, 900, json.dumps(orders_data))  # Cache results
     return jsonify(orders_data), 200
 
-
-
-
 @app.route("/api/orders", methods=["GET"])
 def get_amazon_orders():
     orders = AmazonOrders.query.all()
@@ -336,12 +293,10 @@ def get_amazon_orders():
     ]
     return jsonify(orders_data)
 
-
-#report for fees
 @app.route("/fetch-settlement-data", methods=["GET"])
 def fetch_settlement_data():
     """API to fetch and store Amazon Settlement Data."""
-    selling_partner_id = "A3IW67JB0KIPK8"
+    selling_partner_id = request.args.get("selling_partner_id", "A3IW67JB0KIPK8")
     access_token = get_stored_tokens(selling_partner_id)
 
     if not access_token:
@@ -364,30 +319,3 @@ def fetch_settlement_data():
 
     process_settlement_report(file_path, selling_partner_id)
     return jsonify({"message": "Settlement data fetched and stored successfully!"}), 200
-
-
-
-
-@app.route("/get-settlement-data", methods=["GET"])
-def get_settlement_data():
-    """Retrieve stored settlement data from PostgreSQL."""
-    selling_partner_id = request.args.get("selling_partner_id")
-    if not selling_partner_id:
-        return jsonify({"error": "Missing selling_partner_id"}), 400
-
-    settlement_data = AmazonSettlementData.query.filter_by(selling_partner_id=selling_partner_id).all()
-    if not settlement_data:
-        return jsonify({"message": "No settlement data found"}), 404
-
-    return jsonify([data.to_dict() for data in settlement_data]), 200
-
-
-@app.route("/")
-def home():
-    return "Flask App Running!"
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=True)
-
-

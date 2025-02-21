@@ -7,7 +7,6 @@ import csv
 import os
 import requests
 
-
 def fetch_orders_from_amazon(selling_partner_id, access_token, created_after):
     url = "https://sellingpartnerapi-na.amazon.com/orders/v0/orders"
 
@@ -41,9 +40,6 @@ def fetch_orders_from_amazon(selling_partner_id, access_token, created_after):
         print(f"❌ Error fetching orders: {response.status_code} - {response.text}")
         return []
 
-
-
-
 def request_settlement_report(access_token, selling_partner_id):
     """Request the settlement report from Amazon."""
     url = "https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports"
@@ -54,7 +50,7 @@ def request_settlement_report(access_token, selling_partner_id):
     }
 
     payload = {
-        "reportType": "_GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_",
+        "reportType": "_GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE",
         "dataStartTime": (datetime.utcnow() - timedelta(days=30)).isoformat(),  # Last 30 days
         "dataEndTime": datetime.utcnow().isoformat(),
         "marketplaceIds": ["A1AM78C64UM0Y8"]  # Amazon Mexico Marketplace
@@ -70,8 +66,6 @@ def request_settlement_report(access_token, selling_partner_id):
         print(f"❌ Error requesting report: {response.text}")
         return None
 
-
-
 def get_report_status(access_token, report_id):
     """Check the status of a requested report."""
     url = f"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports/{report_id}"
@@ -82,8 +76,13 @@ def get_report_status(access_token, report_id):
 
     response = requests.get(url, headers=headers)
     if response.status_code == 200:
-        return response.json().get("processingStatus"), response.json().get("reportDocumentId")
-    return None, None
+        processing_status = response.json().get("processingStatus")
+        document_id = response.json().get("reportDocumentId")
+        print(f"🔍 Report status: {processing_status}, Document ID: {document_id}")
+        return processing_status, document_id
+    else:
+        print(f"❌ Error checking report status: {response.text}")
+        return None, None
 
 def download_report(access_token, document_id):
     """Download the settlement report and extract its contents."""
@@ -118,6 +117,7 @@ def process_settlement_report(file_path, selling_partner_id):
         reader = csv.DictReader(file)
 
         for row in reader:
+            print(f"Processing row: {row}")  # Debugging print
             new_entry = AmazonSettlementData(
                 selling_partner_id=selling_partner_id,
                 settlement_id=row.get("settlement_id"),
@@ -134,38 +134,3 @@ def process_settlement_report(file_path, selling_partner_id):
 
         db.session.commit()
     print("✅ Settlement data saved to database.")
-
-
-def download_and_extract_report(report_url, output_file):
-    """
-    Downloads a compressed (.gz) report from Amazon, extracts it, and saves as a CSV.
-    """
-    try:
-        # ✅ Step 1: Download the .gz file
-        response = requests.get(report_url, stream=True)
-        if response.status_code == 200:
-            compressed_file = output_file + ".gz"
-
-            # Save the compressed file
-            with open(compressed_file, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024):
-                    f.write(chunk)
-
-            print(f"✅ Report downloaded: {compressed_file}")
-
-            # ✅ Step 2: Extract the .gz file
-            with gzip.open(compressed_file, "rb") as f_in:
-                with open(output_file, "wb") as f_out:
-                    shutil.copyfileobj(f_in, f_out)
-
-            print(f"✅ Report extracted: {output_file}")
-
-            # ✅ Step 3: Remove compressed file after extraction
-            os.remove(compressed_file)
-
-        else:
-            print(f"❌ Failed to download report: {response.status_code}")
-
-    except Exception as e:
-        print(f"❌ Error in report extraction: {e}")
-
