@@ -9,10 +9,10 @@ from flask_migrate import Migrate
 from dotenv import load_dotenv
 from datetime import timedelta, datetime  # Instead of `import datetime`
 from flask_cors import CORS
-from models import db, AmazonOAuthTokens, AmazonOrders  # Use the correct class name
+from models import db, AmazonOAuthTokens, AmazonOrders, AmazonSettlementData  # Use the correct class name
 import psycopg2
 from psycopg2.extras import execute_values
-from amazon_api import fetch_orders_from_amazon  # Adjust module name if needed
+from amazon_api import fetch_orders_from_amazon, request_settlement_report, download_report, get_report_status, process_settlement_report   # Adjust module name if needed
 
 
 # Load environment variables
@@ -281,44 +281,43 @@ def get_orders():
     selling_partner_id = request.args.get("selling_partner_id")
     if not selling_partner_id:
         return jsonify({"error": "Missing selling_partner_id"}), 400
-    # ✅ Step 1: Check Redis Cache First (To Reduce Database Load)
+
+    # ✅ Step 1: Check Redis Cache First (Optimize Performance)
     cache_key = f"orders:{selling_partner_id}"
     cached_orders = redis_client.get(cache_key)
     if cached_orders:
-        return jsonify(json.loads(cached_orders))  # Return cached orders
-    # ✅ Step 2: Ensure Seller Token Exists
-    token_entry = AmazonOAuthTokens.query.filter_by(selling_partner_id=selling_partner_id).first()
-    if not token_entry:
-        return jsonify({"error": "No OAuth token found for seller"}), 404
-    # ✅ Step 3: Handle Date Filtering Properly
-    try:
-        start_date = datetime.strptime(request.args.get("start_date", (datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%d")), "%Y-%m-%d")
-        end_date = datetime.strptime(request.args.get("end_date", datetime.utcnow().strftime("%Y-%m-%d")), "%Y-%m-%d")
-    except ValueError:
-        return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
-    # ✅ Step 4: Query Database for Orders (Filtering by Date)
+        return jsonify(json.loads(cached_orders))
+
+    # ✅ Step 2: Fetch Orders from Database First
+    one_year_ago = datetime.utcnow() - timedelta(days=365)
     orders = AmazonOrders.query.filter(
         AmazonOrders.selling_partner_id == selling_partner_id,
-        AmazonOrders.purchase_date >= start_date,
-        AmazonOrders.purchase_date <= end_date
-    ).order_by(AmazonOrders.purchase_date.desc()).all()
-    if not orders:
-        return jsonify({"message": "No orders found"}), 404
-    # ✅ Step 5: Convert Orders to JSON Format
-    orders_data = [{
-        "order_id": order.order_id,
-        "total_amount": order.total_amount,
-        "currency": order.currency,
-        "order_status": order.order_status,
-        "purchase_date": order.purchase_date.strftime("%Y-%m-%d"),
-        "marketplace_id": order.marketplace_id,
-        "number_of_items_shipped": order.number_of_items_shipped
-    } for order in orders]
-    # ✅ Step 6: Store in Redis for Caching (Expire in 15 Minutes)
-    redis_client.setex(cache_key, 900, json.dumps(orders_data))
-    return jsonify(orders_data)
+        AmazonOrders.purchase_date >= one_year_ago
+    ).all()
 
+    if orders:
+        orders_data = [order.to_dict() for order in orders]
+        redis_client.setex(cache_key, 900, json.dumps(orders_data))
+        return jsonify(orders_data)
 
+    # ✅ Step 3: If No Orders in DB, Fetch from Amazon API
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return jsonify({"error": "No valid access token found"}), 400
+
+    created_after = one_year_ago.isoformat()
+    fetched_orders = fetch_orders_from_amazon(selling_partner_id, access_token, created_after)
+
+    if not fetched_orders:
+        return jsonify({"error": "No orders found in Amazon API"}), 404
+
+    # ✅ Step 4: Save Orders to Database
+    store_orders_in_db(selling_partner_id, fetched_orders)
+
+    # ✅ Step 5: Return the Newly Fetched Orders
+    orders_data = [order.to_dict() for order in fetched_orders]
+    redis_client.setex(cache_key, 900, json.dumps(orders_data))  # Cache results
+    return jsonify(orders_data), 200
 
 
 
@@ -338,6 +337,49 @@ def get_amazon_orders():
     return jsonify(orders_data)
 
 
+#report for fees
+@app.route("/fetch-settlement-data", methods=["GET"])
+def fetch_settlement_data():
+    """API to fetch and store Amazon Settlement Data."""
+    selling_partner_id = "A3IW67JB0KIPK8"
+    access_token = get_stored_tokens(selling_partner_id)
+
+    if not access_token:
+        return jsonify({"error": "No valid access token found"}), 400
+
+    # Request the settlement report
+    report_id = request_settlement_report(access_token, selling_partner_id)
+    if not report_id:
+        return jsonify({"error": "Failed to request report"}), 500
+
+    # Wait until the report is processed (should ideally use async processing)
+    processing_status, document_id = get_report_status(access_token, report_id)
+    if processing_status != "DONE" or not document_id:
+        return jsonify({"error": "Report still processing"}), 202
+
+    # Download and process the report
+    file_path = download_report(access_token, document_id)
+    if not file_path:
+        return jsonify({"error": "Failed to download report"}), 500
+
+    process_settlement_report(file_path, selling_partner_id)
+    return jsonify({"message": "Settlement data fetched and stored successfully!"}), 200
+
+
+
+
+@app.route("/get-settlement-data", methods=["GET"])
+def get_settlement_data():
+    """Retrieve stored settlement data from PostgreSQL."""
+    selling_partner_id = request.args.get("selling_partner_id")
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    settlement_data = AmazonSettlementData.query.filter_by(selling_partner_id=selling_partner_id).all()
+    if not settlement_data:
+        return jsonify({"message": "No settlement data found"}), 404
+
+    return jsonify([data.to_dict() for data in settlement_data]), 200
 
 
 @app.route("/")
@@ -349,23 +391,3 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, debug=True)
 
 
-selling_partner_id = "A3IW67JB0KIPK8"
-
-with app.app_context():
-    token_entry = AmazonOAuthTokens.query.filter_by(selling_partner_id=selling_partner_id).first()
-
-    if not token_entry:
-        print("❌ No OAuth token found for seller!")
-    else:
-        access_token = token_entry.access_token
-        created_after = (datetime.utcnow() - timedelta(days=365)).isoformat()
-
-        print(f"🔍 Fetching orders for seller {selling_partner_id} since {created_after}")
-
-        orders = fetch_orders_from_amazon(selling_partner_id, access_token, created_after)
-
-        if not orders:
-            print("❌ No orders returned from Amazon API!")
-        else:
-            print(f"✅ Amazon returned {len(orders)} orders!")
-            print(orders[:2])  # Show the first two orders for debugging

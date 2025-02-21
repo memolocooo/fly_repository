@@ -54,3 +54,32 @@ class AmazonOrders(db.Model):
         }
 
 
+class AmazonSettlementData(db.Model):
+    __tablename__ = 'amazon_settlement_data'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    selling_partner_id = db.Column(db.String, db.ForeignKey("amazon_oauth_tokens.selling_partner_id"), nullable=False)
+    settlement_id = db.Column(db.String, nullable=False)
+    date_time = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    order_id = db.Column(db.String, nullable=True)
+    type = db.Column(db.String, nullable=True)
+    amount = db.Column(db.Numeric(10, 2), nullable=True)
+    amazon_fee = db.Column(db.Numeric(10, 2), nullable=True)
+    shipping_fee = db.Column(db.Numeric(10, 2), nullable=True)
+    total_amount = db.Column(db.Numeric(10, 2), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "selling_partner_id": self.selling_partner_id,
+            "settlement_id": self.settlement_id,
+            "date_time": self.date_time.strftime('%Y-%m-%d %H:%M:%S'),
+            "order_id": self.order_id,
+            "type": self.type,
+            "amount": float(self.amount) if self.amount else None,
+            "amazon_fee": float(self.amazon_fee) if self.amazon_fee else None,
+            "shipping_fee": float(self.shipping_fee) if self.shipping_fee else None,
+            "total_amount": float(self.total_amount) if self.total_amount else None,
+            "created_at": self.created_at.strftime('%Y-%m-%d %H:%M:%S')
+        }
