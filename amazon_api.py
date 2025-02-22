@@ -50,8 +50,8 @@ def request_settlement_report(access_token, selling_partner_id):
     }
 
     payload = {
-        "reportType": "_GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE",
-        "dataStartTime": (datetime.utcnow() - timedelta(days=30)).isoformat(),  # Last 30 days
+        "reportType": "GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2",
+        "dataStartTime": (datetime.utcnow() - timedelta(days=365)).isoformat(),  # Last 30 days
         "dataEndTime": datetime.utcnow().isoformat(),
         "marketplaceIds": ["A1AM78C64UM0Y8"]  # Amazon Mexico Marketplace
     }
