@@ -3,6 +3,7 @@ import uuid
 import requests
 import redis
 import json
+import time
 from flask import Flask, session, redirect, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
@@ -293,29 +294,86 @@ def get_amazon_orders():
     ]
     return jsonify(orders_data)
 
+
+
 @app.route("/fetch-settlement-data", methods=["GET"])
 def fetch_settlement_data():
-    """API to fetch and store Amazon Settlement Data."""
-    selling_partner_id = request.args.get("selling_partner_id", "A3IW67JB0KIPK8")
-    access_token = get_stored_tokens(selling_partner_id)
+    selling_partner_id = request.args.get("selling_partner_id")
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
 
+    access_token = get_stored_tokens(selling_partner_id)
     if not access_token:
-        return jsonify({"error": "No valid access token found"}), 400
+        return jsonify({"error": "No valid access token found"}), 401
+
+    print(f"🔍 Fetching settlement data for seller {selling_partner_id}")
 
     # Request the settlement report
     report_id = request_settlement_report(access_token, selling_partner_id)
     if not report_id:
-        return jsonify({"error": "Failed to request report"}), 500
+        print("❌ Failed to request settlement report.")
+        return jsonify({"error": "Failed to request settlement report"}), 500
 
-    # Wait until the report is processed (should ideally use async processing)
-    processing_status, document_id = get_report_status(access_token, report_id)
-    if processing_status != "DONE" or not document_id:
-        return jsonify({"error": "Report still processing"}), 202
+    print(f"✅ Settlement Report Requested, Report ID: {report_id}")
 
-    # Download and process the report
-    file_path = download_report(access_token, document_id)
-    if not file_path:
+    # 🔄 Wait for report to be ready
+    max_attempts = 15
+    attempts = 0
+    document_id = None
+
+    while attempts < max_attempts:
+        print(f"🔄 Checking report status, attempt {attempts + 1}/{max_attempts}")
+        status, document_id = get_report_status(access_token, report_id)
+
+        if status == "DONE" and document_id:
+            print(f"✅ Report Ready! Document ID: {document_id}")
+            break
+        elif status in ["CANCELLED", "FATAL"]:
+            print(f"❌ Report generation failed with status: {status}")
+            return jsonify({"error": f"Report failed with status: {status}"}), 500
+        else:
+            print(f"⏳ Report status: {status}, retrying in 20 seconds...")
+            time.sleep(20)  # ✅ Wait longer before checking again
+
+        attempts += 1
+
+    if not document_id:
+        print("❌ Report processing did not complete in time.")
+        return jsonify({"error": "Report processing timed out"}), 500
+
+    # Download the settlement report
+    report_path = download_report(access_token, document_id)
+    if not report_path:
+        print("❌ Failed to download report.")
         return jsonify({"error": "Failed to download report"}), 500
 
-    process_settlement_report(file_path, selling_partner_id)
-    return jsonify({"message": "Settlement data fetched and stored successfully!"}), 200
+    # Process the report and store in DB
+    try:
+        process_settlement_report(report_path, selling_partner_id)
+        print("✅ Settlement data successfully processed and stored.")
+        return jsonify({"message": "Settlement data successfully stored"}), 200
+    except Exception as e:
+        print(f"❌ Error processing settlement report: {str(e)}")
+        return jsonify({"error": "Error processing settlement data"}), 500
+
+
+@app.route("/get-settlement-data", methods=["GET"])
+def get_settlement_data():
+    selling_partner_id = request.args.get("selling_partner_id")
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    # Query settlement data
+    settlement_entries = AmazonSettlementData.query.filter_by(selling_partner_id=selling_partner_id).all()
+
+    if not settlement_entries:
+        return jsonify({"message": "No settlement data found"}), 404
+
+    # Convert data to JSON
+    results = [entry.to_dict() for entry in settlement_entries]
+    return jsonify(results), 200
+
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)

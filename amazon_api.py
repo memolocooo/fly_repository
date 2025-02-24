@@ -40,6 +40,7 @@ def fetch_orders_from_amazon(selling_partner_id, access_token, created_after):
         print(f"❌ Error fetching orders: {response.status_code} - {response.text}")
         return []
 
+
 def request_settlement_report(access_token, selling_partner_id):
     """Request the settlement report from Amazon."""
     url = "https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports"
@@ -50,21 +51,29 @@ def request_settlement_report(access_token, selling_partner_id):
     }
 
     payload = {
-        "reportType": "GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2",
-        "dataStartTime": (datetime.utcnow() - timedelta(days=365)).isoformat(),  # Last 30 days
+        "reportType": "GET_LEDGER_SUMMARY_VIEW_DATA",  # ✅ Corrected Report Type
+        "dataStartTime": (datetime.utcnow() - timedelta(days=180)).isoformat(),
         "dataEndTime": datetime.utcnow().isoformat(),
         "marketplaceIds": ["A1AM78C64UM0Y8"]  # Amazon Mexico Marketplace
     }
 
+    print(f"📤 Requesting settlement report with payload: {payload}")
+
     response = requests.post(url, headers=headers, json=payload)
 
-    if response.status_code == 200:
+    # Log full response for debugging
+    print(f"🛑 Amazon Response: {response.status_code} - {response.text}")
+
+    if response.status_code == 202:  # ✅ 202 Accepted means report is processing
         report_id = response.json().get("reportId")
-        print(f"✅ Report requested: {report_id}")
-        return report_id
+        print(f"✅ Report request accepted, processing... Report ID: {report_id}")
+        return report_id  
     else:
-        print(f"❌ Error requesting report: {response.text}")
+        print(f"❌ Error requesting report: {response.status_code} - {response.text}")
         return None
+
+
+    
 
 def get_report_status(access_token, report_id):
     """Check the status of a requested report."""
@@ -73,6 +82,8 @@ def get_report_status(access_token, report_id):
     headers = {
         "x-amz-access-token": access_token
     }
+
+    print(f"📡 Checking status for report ID: {report_id}")
 
     response = requests.get(url, headers=headers)
     if response.status_code == 200:
@@ -84,53 +95,95 @@ def get_report_status(access_token, report_id):
         print(f"❌ Error checking report status: {response.text}")
         return None, None
 
-def download_report(access_token, document_id):
-    """Download the settlement report and extract its contents."""
-    url = f"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/documents/{document_id}"
 
+
+import os
+import requests
+
+def download_report(access_token, document_id):
+    """Download the settlement report from Amazon."""
+    url = f"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/documents/{document_id}"
+    
     headers = {
-        "x-amz-access-token": access_token
+        "x-amz-access-token": access_token,
+        "Content-Type": "application/json"
     }
 
+    print(f"📥 Downloading report with Document ID: {document_id}")
+
     response = requests.get(url, headers=headers)
+    
     if response.status_code == 200:
+        print(f"✅ Report metadata retrieved: {response.json()}")  # Debugging
+
         report_url = response.json().get("url")
+        if not report_url:
+            print("❌ No download URL found!")
+            return None
 
-        # Download the report
-        report_response = requests.get(report_url, stream=True)
-        with open("settlement_report.gz", "wb") as f:
-            f.write(report_response.content)
+        print(f"🔗 Report Download URL: {report_url}")
 
-        # Extract the report
-        with gzip.open("settlement_report.gz", "rb") as f_in, open("settlement_report.csv", "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
+        # Download actual file
+        report_response = requests.get(report_url)
+        if report_response.status_code == 200:
+            file_path = f"settlement_report_{document_id}.txt"
+            print(f"✅ Report downloaded successfully, saving to {file_path}")
 
-        print("✅ Report downloaded and extracted.")
-        return "settlement_report.csv"
+            with open(file_path, "wb") as f:
+                f.write(report_response.content)
+            
+            print(f"📂 Report saved at {file_path}")
+            return file_path
+        else:
+            print(f"❌ Error downloading report: {report_response.status_code}")
+            return None
     else:
-        print(f"❌ Error downloading report: {response.text}")
+        print(f"❌ Failed to retrieve document metadata: {response.status_code}")
         return None
 
+
+
+
+
 def process_settlement_report(file_path, selling_partner_id):
-    """Process and store settlement data in PostgreSQL."""
-    with open(file_path, mode='r', encoding="utf-8") as file:
-        reader = csv.DictReader(file)
+    """Process the settlement report and store data in PostgreSQL."""
+    print(f"📂 Opening settlement report: {file_path}")
 
-        for row in reader:
-            print(f"Processing row: {row}")  # Debugging print
-            new_entry = AmazonSettlementData(
-                selling_partner_id=selling_partner_id,
-                settlement_id=row.get("settlement_id"),
-                date_time=row.get("date_time"),
-                order_id=row.get("order_id"),
-                type=row.get("type"),
-                amount=row.get("amount"),
-                amazon_fee=row.get("amazon_fee"),
-                shipping_fee=row.get("shipping_fee"),
-                total_amount=row.get("total_amount"),
-                created_at=datetime.utcnow()
-            )
-            db.session.add(new_entry)
+    with open(file_path, "r", encoding="utf-8") as file:
+        lines = file.readlines()
 
-        db.session.commit()
-    print("✅ Settlement data saved to database.")
+    print(f"🔍 First 5 lines of the report:\n{lines[:5]}")  # DEBUGGING LINE
+
+    if not lines:
+        print("❌ Settlement report is empty!")
+        return
+
+    # Process CSV data
+    reader = csv.reader(lines)
+    headers = next(reader)  # Get column names
+    print(f"📝 Headers: {headers}")  # DEBUGGING LINE
+
+    # Continue with inserting into the database...
+
+
+def store_settlement_data(data):
+    """Insert settlement data into PostgreSQL."""
+    for row in data:
+        print(f"🛠️ Inserting row: {row}")  # DEBUGGING LINE
+        new_entry = AmazonSettlementData(
+            selling_partner_id=row["selling_partner_id"],
+            settlement_id=row["settlement_id"],
+            date_time=row["date_time"],
+            order_id=row["order_id"],
+            type=row["type"],
+            amount=row["amount"],
+            amazon_fee=row["amazon_fee"],
+            shipping_fee=row["shipping_fee"],
+            total_amount=row["total_amount"],
+            created_at=datetime.utcnow()
+        )
+        db.session.add(new_entry)
+    
+    db.session.commit()
+    print(f"✅ Successfully stored {len(data)} settlement records.")
+
