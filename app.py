@@ -2,6 +2,7 @@ import os
 import uuid
 import requests
 import redis
+import logging
 import json
 import time
 from flask import Flask, session, redirect, request, jsonify
@@ -158,25 +159,31 @@ def save_oauth_tokens(selling_partner_id, access_token, refresh_token, expires_i
         if conn:
             conn.close()
 
+
+
 def store_orders_in_db(selling_partner_id, orders):
-    """Save only necessary Amazon order fields into PostgreSQL."""
+    """Save only necessary Amazon order fields into PostgreSQL, including fees and shipping price."""
     for order in orders:
-        order_id = order.get("AmazonOrderId")  # ✅ Amazon's order ID
+        order_id = order.get("AmazonOrderId")
         marketplace_id = order.get("MarketplaceId")
-        amazon_order_id = order.get("AmazonOrderId")  # ✅ Ensure this field is stored
+        amazon_order_id = order.get("AmazonOrderId")
         number_of_items_shipped = order.get("NumberOfItemsShipped", 0)
         order_status = order.get("OrderStatus", "UNKNOWN")
         total_amount = float(order.get("OrderTotal", {}).get("Amount", 0) or 0)
         currency = order.get("OrderTotal", {}).get("CurrencyCode")
         purchase_date = order.get("PurchaseDate")
 
-        # Check if the order already exists
+        # ✅ Extract Amazon fees and shipping price
+        amazon_fees = float(order.get("AmazonFees", {}).get("Amount", 0) or 0)
+        shipping_price = float(order.get("ShippingPrice", {}).get("Amount", 0) or 0)
+
+        # ✅ Check if the order already exists
         existing_order = AmazonOrders.query.filter_by(order_id=order_id).first()
 
         if not existing_order:  # ✅ Avoid duplicate entries
             new_order = AmazonOrders(
                 order_id=order_id,
-                amazon_order_id=amazon_order_id,  # ✅ Ensure this is stored
+                amazon_order_id=amazon_order_id,
                 marketplace_id=marketplace_id,
                 selling_partner_id=selling_partner_id,
                 number_of_items_shipped=number_of_items_shipped,
@@ -184,13 +191,18 @@ def store_orders_in_db(selling_partner_id, orders):
                 total_amount=total_amount,
                 currency=currency,
                 purchase_date=datetime.strptime(purchase_date, "%Y-%m-%dT%H:%M:%SZ"),
+                amazon_fees=amazon_fees,  # ✅ Store Amazon fees
+                shipping_price=shipping_price,  # ✅ Store shipping price
                 created_at=datetime.utcnow()
             )
 
             db.session.add(new_order)
 
     db.session.commit()
-    print(f"✅ {len(orders)} orders saved to database.")
+    print(f"✅ {len(orders)} orders saved to database with Amazon fees & shipping price.")
+
+
+
 
 @app.route('/start-oauth')
 def start_oauth():
@@ -208,6 +220,8 @@ def start_oauth():
 
     print(f"🔗 OAuth Redirect URL: {oauth_url}")
     return redirect(oauth_url)
+
+
 
 @app.route('/callback')
 def callback():
@@ -236,6 +250,10 @@ def callback():
         )
         return redirect(f"https://guillermos-amazing-site-b0c75a.webflow.io/dashboard")
     return jsonify({"error": "Failed to obtain tokens", "details": token_data}), 400
+
+
+
+
 
 @app.route("/get-orders", methods=["GET"])
 def get_orders():
@@ -339,9 +357,31 @@ def fetch_fba_fees():
 
 
 
+@app.route("/")
+def home():
+    return "Flask is running on Fly.io!"
+
+
+
+# ✅ Ensure logs go to stdout for Fly.io
+logging.basicConfig(level=logging.INFO)
+
+@app.before_request
+def log_request():
+    """Log incoming HTTP requests."""
+    logging.info(f"📥 Request: {request.method} {request.url}")
+
+
+
+@app.after_request
+def log_response(response):
+    """Log outgoing HTTP responses."""
+    logging.info(f"📤 Response: {response.status_code} {request.url}")
+    return response
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
-
-
+    print("🚀 Starting Flask server...")
+    app.run(host="0.0.0.0", port=8080, debug=False)
 
 

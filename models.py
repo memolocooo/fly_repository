@@ -37,6 +37,8 @@ class AmazonOrders(db.Model):
     currency = db.Column(db.String, nullable=True)
     purchase_date = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    amazon_fees = db.Column(db.Numeric(10, 2), nullable=True, default=0)
+    shipping_price = db.Column(db.Numeric(10, 2), nullable=True, default=0)
 
     def to_dict(self):
         return {
@@ -50,7 +52,9 @@ class AmazonOrders(db.Model):
             "total_amount": float(self.total_amount) if self.total_amount else None,
             "currency": self.currency,
             "purchase_date": self.purchase_date.strftime('%Y-%m-%d %H:%M:%S') if self.purchase_date else None,
-            "created_at": self.created_at.strftime('%Y-%m-%d %H:%M:%S')
+            "created_at": self.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+            "amazon_fees": self.amazon_fees,
+            "shipping_price": self.shipping_price
         }
 
 

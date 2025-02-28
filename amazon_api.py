@@ -11,8 +11,7 @@ import json
 import chardet
 from sp_api.api import Reports
 from sp_api.base import Marketplaces, ReportType
-import requests
-
+import threading
 
 
 
@@ -25,9 +24,10 @@ def fetch_orders_from_amazon(selling_partner_id, access_token, created_after):
     }
 
     params = {
-        "MarketplaceIds": ["A1AM78C64UM0Y8"],  # ✅ Amazon Mexico Marketplace
-        "CreatedAfter": (datetime.utcnow() - timedelta(days=365)).isoformat(),  # ✅ Ensure 1 year
-        "OrderStatuses": ["Shipped", "Unshipped", "Canceled"]
+        "MarketplaceIds": ["A1AM78C64UM0Y8"],
+        "CreatedAfter": created_after,
+        "OrderStatuses": ["Shipped", "Unshipped", "Canceled"],
+        "OptionalFields": ["AmazonFees", "ShippingPrice"]  # ✅ Include these fields in API response
     }
 
     print(f"🔍 Fetching orders for seller {selling_partner_id} since {params['CreatedAfter']}")
@@ -36,7 +36,7 @@ def fetch_orders_from_amazon(selling_partner_id, access_token, created_after):
 
     if response.status_code == 200:
         orders = response.json()
-        print(f"✅ Amazon API Response: {orders}")  # ✅ Debugging print
+        print(f"✅ Amazon API Response: {orders}")
 
         if "Orders" in orders:
             return orders["Orders"]
@@ -48,6 +48,7 @@ def fetch_orders_from_amazon(selling_partner_id, access_token, created_after):
     else:
         print(f"❌ Error fetching orders: {response.status_code} - {response.text}")
         return []
+
 
 
 
@@ -66,10 +67,10 @@ def fetch_fba_fees_report(access_token, selling_partner_id):
     }
 
     payload = {
-        "reportType": ReportType.FEE_DISCOUNTS_REPORT,  # ✅ Using Enum Instead of Hardcoded String
+        "reportType": ReportType.GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL,  # ✅ Using Enum Instead of Hardcoded String
         "dataStartTime": (datetime.utcnow() - timedelta(days=365)).isoformat(),  # Last Year’s Data
         "marketplaceIds": [MARKETPLACE_ID]
-    }
+    }   
 
     print(f"📤 Requesting FBA Fees Report: {payload}")
 
@@ -83,120 +84,145 @@ def fetch_fba_fees_report(access_token, selling_partner_id):
         print(f"❌ Error requesting report: {response.status_code} - {response.text}")
         return None
     
-    
 
+import time
+import requests
 
 def get_fba_report_status(access_token, report_id):
-    """Check the status of the FBA Fee Report."""
+    """Check the status of an Amazon FBA Fees Report and wait until it's ready."""
     url = f"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports/{report_id}"
-
-    headers = {"x-amz-access-token": access_token}
-
-    print(f"📡 Checking status for report ID: {report_id}")
-
-    for attempt in range(15):  # Retry up to 15 times
-        response = requests.get(url, headers=headers)
-        
-        if response.status_code == 200:
-            data = response.json()
-            processing_status = data.get("processingStatus")
-            document_id = data.get("reportDocumentId")
-
-            print(f"🔍 Report Status: {processing_status}")
-
-            if processing_status == "DONE":
-                print(f"✅ Report Ready! Document ID: {document_id}")
-                return document_id
-            elif processing_status in ["FATAL", "CANCELLED"]:
-                print("❌ Report generation failed.")
-                return None
-            else:
-                print("⏳ Report is still processing, retrying in 30 seconds...")
-                time.sleep(30)
-        else:
-            print(f"❌ Error checking report status: {response.text}")
-            return None
-
-    print("❌ Report processing did not complete in time.")
-    return None
-
-
-def download_fba_fees_report(access_token, document_id):
-    """Download the FBA Fee Report from Amazon."""
-    url = f"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/documents/{document_id}"
 
     headers = {
         "x-amz-access-token": access_token,
         "Content-Type": "application/json"
     }
 
+    retries = 0
+    max_retries = 20  # Maximum attempts (adjust as needed)
+    wait_time = 30  # Start with 30 seconds wait
+
+    while retries < max_retries:
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 200:
+            report_data = response.json()
+            status = report_data.get("processingStatus")
+
+            print(f"🔍 Report Status: {status}")
+
+            if status == "DONE":
+                document_id = report_data.get("reportDocumentId")
+                print(f"✅ Report is ready! Document ID: {document_id}")
+                return document_id  # Now the report is ready, return the document ID
+
+            elif status in ["CANCELLED", "FATAL"]:
+                print("❌ Report failed to process.")
+                return None
+
+        else:
+            print(f"❌ Error checking report status: {response.status_code} - {response.text}")
+
+        retries += 1
+        print(f"⏳ Report is still processing, retrying in {wait_time} seconds...")
+        time.sleep(wait_time)
+        wait_time *= 1.5  # Increase wait time for each retry
+
+    print("🚨 Report did not finish in time. Try again later.")
+    return None
+
+
+
+
+
+
+
+
+def download_fba_fees_report(access_token, document_id):
+    """Download and decode the FBA Fees Report from Amazon SP-API."""
+    url = f"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/documents/{document_id}"
+    headers = {"x-amz-access-token": access_token}
+
     print(f"📥 Downloading FBA Fees Report with Document ID: {document_id}")
 
     response = requests.get(url, headers=headers)
-
-    if response.status_code == 200:
-        report_url = response.json().get("url")
-        if not report_url:
-            print("❌ No download URL found!")
-            return None
-
-        print(f"🔗 Report Download URL: {report_url}")
-
-        # Download the actual report
-        report_response = requests.get(report_url)
-        if report_response.status_code == 200:
-            file_path = f"fba_fees_report_{document_id}.txt"
-            with open(file_path, "wb") as f:
-                f.write(report_response.content)
-
-            print(f"✅ FBA Fees Report saved at {file_path}")
-            return file_path
-        else:
-            print(f"❌ Error downloading report: {report_response.status_code}")
-            return None
-    else:
-        print(f"❌ Failed to retrieve document metadata: {response.status_code}")
+    if response.status_code != 200:
+        print(f"❌ Error fetching report metadata: {response.status_code} - {response.text}")
         return None
 
+    report_url = response.json().get("url")
+    if not report_url:
+        print("❌ No download URL found!")
+        return None
 
-def process_fba_fees_report(file_path, selling_partner_id):
-    """Process the FBA Fees Report and store data in the database."""
-    print(f"📂 Processing FBA Fees Report: {file_path}")
+    print(f"🔗 Report Download URL: {report_url}")
 
-    with open(file_path, "r", encoding="utf-8") as file:
-        lines = file.readlines()
+    # Download the actual report
+    report_response = requests.get(report_url)
+    if report_response.status_code != 200:
+        print(f"❌ Error downloading report: {report_response.status_code}")
+        return None
 
-    if not lines:
-        print("❌ FBA Fees Report is empty!")
-        return
+    # Save to temporary file
+    temp_file_path = f"fba_fees_report_{document_id}.txt"
+    with open(temp_file_path, "wb") as f:
+        f.write(report_response.content)
 
-    # Process CSV data (Assuming the report is CSV formatted)
-    import csv
-    reader = csv.reader(lines)
-    headers = next(reader)
+    print(f"✅ FBA Fees Report downloaded and saved at {temp_file_path}")
 
-    print(f"📝 Headers: {headers}")
+    # Ensure it's decompressed if needed
+    decompressed_file = decompress_gzip(temp_file_path)
 
-    data_to_store = []
-    for row in reader:
-        fee_data = dict(zip(headers, row))
-        data_to_store.append(
-            AmazonSettlementData(
-                selling_partner_id=selling_partner_id,
-                order_id=fee_data.get("Order ID"),
-                type=fee_data.get("Fee Type"),
-                amount=float(fee_data.get("Fee Amount", 0)),
-                amazon_fee=float(fee_data.get("Amazon Fee", 0)),
-                shipping_fee=float(fee_data.get("Shipping Fee", 0)),
-                total_amount=float(fee_data.get("Total Amount", 0)),
-                created_at=datetime.utcnow()
-            )
+    return decompressed_file  # Return the final file path
+
+
+
+def save_settlement_data(fee_data, selling_partner_id):
+    """Saves settlement data to the database."""
+    try:
+        data_entry = AmazonSettlementData(
+            selling_partner_id=selling_partner_id,
+            order_id=fee_data.get("Order ID"),
+            type=fee_data.get("Fee Type"),
+            amount=float(fee_data.get("Fee Amount", 0) or 0),
+            amazon_fee=float(fee_data.get("Amazon Fee", 0) or 0),
+            shipping_fee=float(fee_data.get("Shipping Fee", 0) or 0),
+            total_amount=float(fee_data.get("Total Amount", 0) or 0),
+            created_at=datetime.utcnow()
         )
+        db.session.add(data_entry)
+        db.session.commit()
+        print(f"✅ Saved settlement data for Order ID: {fee_data.get('Order ID')}")
+    except Exception as e:
+        db.session.rollback()
+        print(f"❌ Error saving settlement data: {e}")
 
-    # Store data in the database
-    db.session.bulk_save_objects(data_to_store)
-    db.session.commit()
-    print(f"✅ Successfully stored {len(data_to_store)} FBA fee records.")
+
+
+
+def process_fba_fees_report(report_path, selling_partner_id):
+    """Process the downloaded FBA Fees Report and save data."""
+    try:
+        with open(report_path, mode="r", encoding="utf-8") as file:
+            reader = csv.reader(file)
+            headers = next(reader)  # Read the first row as headers
+            
+            print(f"📂 Report Headers: {headers}")  # ✅ Print headers
+
+            for row in reader:
+                fee_data = dict(zip(headers, row))  # Map row data to headers
+                
+                print(f"🔍 Extracted Data: {fee_data}")  # ✅ Print extracted data
+
+                # ✅ Ensure `save_settlement_data` is called correctly
+                save_settlement_data(fee_data, selling_partner_id)
+
+        print("✅ Report processing complete.")
+    
+    except Exception as e:
+        print(f"❌ Error processing FBA Fees Report: {e}")
+
+
+
 
 
 
@@ -205,9 +231,15 @@ def process_fba_fees_report(file_path, selling_partner_id):
 def detect_encoding(file_path):
     """Detect file encoding before reading."""
     with open(file_path, "rb") as f:
-        raw_data = f.read(10000)  # Read first 10KB
+        raw_data = f.read(100000)  # ✅ Increase to 100KB for better detection
     result = chardet.detect(raw_data)
-    return result['encoding']
+    detected_encoding = result["encoding"]
+
+    if not detected_encoding:
+        detected_encoding = "utf-8"  # ✅ Default to UTF-8 if detection fails
+
+    print(f"🔍 Detected Encoding: {detected_encoding}")
+    return detected_encoding
 
 
 
@@ -273,4 +305,6 @@ def decompress_gzip(file_path):
                 shutil.copyfileobj(f_in, f_out)
         print(f"✅ Decompressed file saved as {decompressed_path}")
         return decompressed_path
-    return file_path
+    return file_path  # ✅ Return original if no decompression needed
+
+
