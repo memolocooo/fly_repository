@@ -14,7 +14,9 @@ from flask_cors import CORS
 from models import db, AmazonOAuthTokens, AmazonOrders, AmazonSettlementData  # Use the correct class name
 import psycopg2
 from psycopg2.extras import execute_values
-from amazon_api import fetch_orders_from_amazon, fetch_fba_fees_report, get_fba_report_status, download_fba_fees_report, process_fba_fees_report   # Adjust module name if needed
+from amazon_api import fetch_orders_from_amazon, fetch_financial_events, store_financial_data
+from utils import get_stored_tokens
+
 
 # Load environment variables
 load_dotenv()
@@ -319,42 +321,6 @@ def get_amazon_orders():
 
 
 
-@app.route("/fetch-fba-fees", methods=["GET"])
-def fetch_fba_fees():
-    selling_partner_id = request.args.get("selling_partner_id")
-    if not selling_partner_id:
-        return jsonify({"error": "Missing selling_partner_id"}), 400
-
-    access_token = get_stored_tokens(selling_partner_id)
-    if not access_token:
-        return jsonify({"error": "No valid access token found"}), 401
-
-    print(f"🔍 Fetching FBA Fees for seller {selling_partner_id}")
-
-    # Step 1: Request the FBA Fee Report
-    report_id = fetch_fba_fees_report(access_token, selling_partner_id)
-    if not report_id:
-        return jsonify({"error": "Failed to request FBA fees report"}), 500
-
-    print(f"✅ FBA Fees Report Requested, Report ID: {report_id}")
-
-    # Step 2: Wait for report to be ready
-    document_id = get_fba_report_status(access_token, report_id)
-    if not document_id:
-        return jsonify({"error": "Report processing timed out"}), 500
-
-    # Step 3: Download the report
-    report_path = download_fba_fees_report(access_token, document_id)
-    if not report_path:
-        return jsonify({"error": "Failed to download FBA fees report"}), 500
-
-    # Step 4: Process and store data
-    try:
-        process_fba_fees_report(report_path, selling_partner_id)
-        return jsonify({"message": "FBA fees data successfully stored"}), 200
-    except Exception as e:
-        return jsonify({"error": f"Error processing FBA fees report: {str(e)}"}), 500
-
 
 
 @app.route("/")
@@ -385,3 +351,33 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, debug=False)
 
 
+
+from utils import get_stored_tokens
+from models import db  # Correct import for your database connection
+
+# Example route using Flask
+@app.route('/fetch-financial-events')
+def fetch_financial_events():
+    selling_partner_id = request.args.get("selling_partner_id")
+    tokens = get_stored_tokens(db, selling_partner_id)  # Pass database
+    
+    if not tokens:
+        return jsonify({"error": "No valid tokens found"}), 400
+
+    # Fetch financial data...
+
+
+
+@app.route("/get-financial-data", methods=["GET"])
+def get_financial_data():
+    """Retrieve stored financial transactions"""
+    selling_partner_id = request.args.get("selling_partner_id")
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    transactions = AmazonSettlementData.query.filter_by(selling_partner_id=selling_partner_id).all()
+
+    if not transactions:
+        return jsonify({"error": "No financial data found"}), 404
+
+    return jsonify([transaction.to_dict() for transaction in transactions]), 200
