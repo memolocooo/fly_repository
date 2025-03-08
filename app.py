@@ -14,7 +14,7 @@ from flask_cors import CORS
 from models import db, AmazonOAuthTokens, AmazonOrders, AmazonSettlementData  # Use the correct class name
 import psycopg2
 from psycopg2.extras import execute_values
-from amazon_api import fetch_orders_from_amazon, fetch_financial_events, store_financial_data
+from amazon_api import fetch_orders_from_amazon, fetch_financial_events
 from utils import get_stored_tokens
 
 
@@ -346,38 +346,25 @@ def log_response(response):
     return response
 
 
+
+one_year_ago = datetime.utcnow() - timedelta(days=365)
+
+@app.route("/fetch-financial-events", methods=["GET"])
+def fetch_financial_events_endpoint():
+    selling_partner_id = request.args.get("selling_partner_id")
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    financial_events = fetch_financial_events(selling_partner_id)
+    if not financial_events:
+        return jsonify({"error": "Failed to fetch financial events"}), 500
+
+    return jsonify(financial_events), 200
+
+
+
 if __name__ == "__main__":
     print("🚀 Starting Flask server...")
     app.run(host="0.0.0.0", port=8080, debug=False)
 
 
-
-from utils import get_stored_tokens
-from models import db  # Correct import for your database connection
-
-# Example route using Flask
-@app.route('/fetch-financial-events')
-def fetch_financial_events():
-    selling_partner_id = request.args.get("selling_partner_id")
-    tokens = get_stored_tokens(db, selling_partner_id)  # Pass database
-    
-    if not tokens:
-        return jsonify({"error": "No valid tokens found"}), 400
-
-    # Fetch financial data...
-
-
-
-@app.route("/get-financial-data", methods=["GET"])
-def get_financial_data():
-    """Retrieve stored financial transactions"""
-    selling_partner_id = request.args.get("selling_partner_id")
-    if not selling_partner_id:
-        return jsonify({"error": "Missing selling_partner_id"}), 400
-
-    transactions = AmazonSettlementData.query.filter_by(selling_partner_id=selling_partner_id).all()
-
-    if not transactions:
-        return jsonify({"error": "No financial data found"}), 404
-
-    return jsonify([transaction.to_dict() for transaction in transactions]), 200

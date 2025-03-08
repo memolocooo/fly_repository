@@ -12,8 +12,9 @@ from sp_api.api import Reports
 from sp_api.base import Marketplaces, ReportType
 import threading
 from utils import get_stored_tokens  # Ensure correct import
+import logging
 
-BASE_FINANCE_URL = "https://sellingpartnerapi-na.amazon.com/finances/v0"
+
 
 def fetch_orders_from_amazon(selling_partner_id, access_token, created_after):
     url = "https://sellingpartnerapi-na.amazon.com/orders/v0/orders"
@@ -34,42 +35,29 @@ def fetch_orders_from_amazon(selling_partner_id, access_token, created_after):
         print(f"❌ Error fetching orders: {response.status_code} - {response.text}")
         return []
 
+
+
+BASE_FINANCE_URL = "https://sellingpartnerapi-na.amazon.com/finances/v0"
+
 def fetch_financial_events(selling_partner_id):
+    logging.info(f"Fetching financial events for selling_partner_id: {selling_partner_id}")
     access_token = get_stored_tokens(selling_partner_id)
     if not access_token:
+        logging.error("No valid access token found")
         return {"error": "No valid access token found"}
 
     headers = {
         "x-amz-access-token": access_token,
         "Content-Type": "application/json"
     }
-    url = f"{BASE_FINANCE_URL}/financialEvents"
+
+    one_year_ago = (datetime.utcnow() - timedelta(days=365)).isoformat()
+    url = f"{BASE_FINANCE_URL}/financialEvents?PostedAfter={one_year_ago}"
     response = requests.get(url, headers=headers)
-    
+
     if response.status_code == 200:
+        logging.info("Successfully fetched financial events")
         return response.json()
     else:
-        print(f"❌ Error fetching financial events: {response.text}")
+        logging.error(f"Error fetching financial events: {response.text}")
         return None
-
-def store_financial_data(selling_partner_id, financial_events):
-    if not financial_events or "FinancialEvents" not in financial_events:
-        print("❌ No financial events to store.")
-        return
-
-    for event in financial_events.get("FinancialEvents", {}).get("ShipmentEventList", []):
-        new_settlement = AmazonSettlementData(
-            selling_partner_id=selling_partner_id,
-            settlement_id=event.get("AmazonOrderId"),
-            date_time=datetime.utcnow(),
-            order_id=event.get("AmazonOrderId"),
-            type=event.get("EventType", "UNKNOWN"),
-            amount=event.get("Amount", {}).get("CurrencyAmount", 0),
-            amazon_fee=event.get("FeeAmount", {}).get("CurrencyAmount", 0),
-            shipping_fee=event.get("ShippingAmount", {}).get("CurrencyAmount", 0),
-            total_amount=event.get("TotalAmount", {}).get("CurrencyAmount", 0)
-        )
-        db.session.add(new_settlement)
-    
-    db.session.commit()
-    print("✅ Financial transactions saved successfully!")
