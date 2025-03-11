@@ -14,8 +14,7 @@ from flask_cors import CORS
 from models import db, AmazonOAuthTokens, AmazonOrders, AmazonSettlementData  # Use the correct class name
 import psycopg2
 from psycopg2.extras import execute_values
-from amazon_api import fetch_orders_from_amazon, fetch_financial_events
-from utils import get_stored_tokens
+from amazon_api import fetch_orders_from_amazon, fetch_financial_events, fetch_shipping_data, fetch_fees_data
 
 
 # Load environment variables
@@ -28,7 +27,7 @@ app.secret_key = os.getenv("SECRET_KEY", "fallback-secret-key")
 redis_client = redis.StrictRedis(host="localhost", port=6379, decode_responses=True)
 
 # Database configuration
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@0.0.0.0:5432/dbname")
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
@@ -347,24 +346,98 @@ def log_response(response):
 
 
 
-one_year_ago = datetime.utcnow() - timedelta(days=365)
-
 @app.route("/fetch-financial-events", methods=["GET"])
 def fetch_financial_events_endpoint():
     selling_partner_id = request.args.get("selling_partner_id")
     if not selling_partner_id:
+        logging.error("❌ Missing selling_partner_id")
         return jsonify({"error": "Missing selling_partner_id"}), 400
 
-    financial_events = fetch_financial_events(selling_partner_id)
-    if not financial_events:
-        return jsonify({"error": "Failed to fetch financial events"}), 500
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        logging.error("❌ No valid access token found")
+        return jsonify({"error": "No valid access token found"}), 401
 
-    return jsonify(financial_events), 200
+    posted_after = (datetime.utcnow() - timedelta(days=365)).isoformat()
 
+    try:
+        financial_events = fetch_financial_events(selling_partner_id, access_token, posted_after)
+
+        if financial_events is None:
+            logging.error("❌ Financial events response is None")
+            return jsonify({"error": "Failed to fetch financial events"}), 500
+
+        logging.info(f"📊 API Response: {json.dumps(financial_events, indent=2)[:500]}")  # Log the first 500 chars of response
+        return jsonify(financial_events), 200
+
+    except Exception as e:
+        logging.error(f"❌ Exception occurred: {str(e)}")
+        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+
+
+
+@app.route("/fetch-shipping-data", methods=["GET"])
+def fetch_shipping_data_endpoint():
+    selling_partner_id = request.args.get("selling_partner_id")
+    if not selling_partner_id:
+        logging.error("❌ Missing selling_partner_id")
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        logging.error("❌ No valid access token found")
+        return jsonify({"error": "No valid access token found"}), 401
+
+    try:
+        shipping_data = fetch_shipping_data(selling_partner_id, access_token)
+
+        if shipping_data is None:
+            logging.error("❌ Shipping data response is None")
+            return jsonify({"error": "Failed to fetch shipping data"}), 500
+
+        logging.info(f"📦 API Response: {json.dumps(shipping_data, indent=2)[:500]}")  # Log first 500 chars
+        return jsonify(shipping_data), 200
+
+    except Exception as e:
+        logging.error(f"❌ Exception occurred: {str(e)}")
+        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+
+
+
+
+
+
+@app.route('/api/fetch_fees', methods=['GET'])
+def get_fees_data():
+    selling_partner_id = request.args.get('selling_partner_id')
+
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return jsonify({"error": "No valid access token found"}), 401
+
+    data = fetch_fees_data(selling_partner_id, access_token)
+
+    if data is not None:
+        return jsonify(data), 200
+    else:
+        # Attempt to refresh the token and retry
+        access_token = refresh_access_token(selling_partner_id)
+        if access_token:
+            data = fetch_fees_data(selling_partner_id, access_token)
+            if data is not None:
+                return jsonify(data), 200
+
+        return jsonify({"error": "Failed to fetch fees data"}), 500
 
 
 if __name__ == "__main__":
     print("🚀 Starting Flask server...")
     app.run(host="0.0.0.0", port=8080, debug=False)
+
+
+
 
 

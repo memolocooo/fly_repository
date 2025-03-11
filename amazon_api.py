@@ -11,7 +11,6 @@ import chardet
 from sp_api.api import Reports
 from sp_api.base import Marketplaces, ReportType
 import threading
-from utils import get_stored_tokens  # Ensure correct import
 import logging
 
 
@@ -39,25 +38,98 @@ def fetch_orders_from_amazon(selling_partner_id, access_token, created_after):
 
 BASE_FINANCE_URL = "https://sellingpartnerapi-na.amazon.com/finances/v0"
 
-def fetch_financial_events(selling_partner_id):
-    logging.info(f"Fetching financial events for selling_partner_id: {selling_partner_id}")
-    access_token = get_stored_tokens(selling_partner_id)
-    if not access_token:
-        logging.error("No valid access token found")
-        return {"error": "No valid access token found"}
+
+def fetch_financial_events(selling_partner_id, access_token, posted_after):
+    """Fetch financial events from Amazon SP-API"""
+    logging.info(f"📡 Fetching financial events for seller: {selling_partner_id} since {posted_after}")
 
     headers = {
         "x-amz-access-token": access_token,
         "Content-Type": "application/json"
     }
 
-    one_year_ago = (datetime.utcnow() - timedelta(days=365)).isoformat()
-    url = f"{BASE_FINANCE_URL}/financialEvents?PostedAfter={one_year_ago}"
+    url = f"{BASE_FINANCE_URL}/financialEvents?PostedAfter={posted_after}"
     response = requests.get(url, headers=headers)
 
-    if response.status_code == 200:
-        logging.info("Successfully fetched financial events")
-        return response.json()
-    else:
-        logging.error(f"Error fetching financial events: {response.text}")
+    try:
+        if response.status_code == 200:
+            data = response.json()
+            logging.info(f"✅ Amazon API Response: {json.dumps(data, indent=2)[:500]}")  # ✅ Log first 500 chars
+            return data  # ✅ Ensure we return the full data, not an empty list
+
+        else:
+            logging.error(f"❌ Error fetching financial events: {response.status_code} - {response.text}")
+            return None
+    except json.JSONDecodeError:
+        logging.error("❌ JSON Parsing Error - Invalid JSON Response")
         return None
+    except Exception as e:
+        logging.error(f"❌ Unexpected Exception: {str(e)}")
+        return None
+
+
+BASE_SHIPPING_URL = "https://sellingpartnerapi-na.amazon.com/shipping/v1"
+
+def fetch_shipping_data(selling_partner_id, access_token):
+    """Fetch shipping data from Amazon SP-API."""
+    logging.info(f"📡 Fetching shipping data for seller: {selling_partner_id}")
+
+    headers = {
+        "x-amz-access-token": access_token,
+        "Content-Type": "application/json"
+    }
+
+    url = f"{BASE_SHIPPING_URL}/shipments"
+
+    response = requests.get(url, headers=headers)
+
+    try:
+        if response.status_code == 200:
+            data = response.json()
+            logging.info(f"✅ Amazon API Response: {json.dumps(data, indent=2)[:500]}")  # Log first 500 chars
+            return data
+
+        else:
+            logging.error(f"❌ Error fetching shipping data: {response.status_code} - {response.text}")
+            return None
+    except json.JSONDecodeError:
+        logging.error("❌ JSON Parsing Error - Invalid JSON Response")
+        return None
+    except Exception as e:
+        logging.error(f"❌ Unexpected Exception: {str(e)}")
+        return None
+
+
+BASE_FEES_URL = "https://sellingpartnerapi-na.amazon.com/fees/v0"
+
+def fetch_fees_data(selling_partner_id, access_token):
+    """Fetch fees data from Amazon SP-API."""
+    logging.info(f"📡 Fetching fees data for seller: {selling_partner_id}")
+
+    headers = {
+        "x-amz-access-token": access_token,
+        "Content-Type": "application/json"
+    }
+
+    url = f"{BASE_FEES_URL}/listings/fees"
+
+    response = requests.get(url, headers=headers)
+
+    try:
+        if response.status_code == 200:
+            data = response.json()
+            logging.info(f"✅ Amazon API Response: {json.dumps(data, indent=2)[:500]}")  # Log first 500 chars
+            return data
+
+        else:
+            logging.error(f"❌ Error fetching fees data: {response.status_code} - {response.text}")
+            return None
+    except json.JSONDecodeError:
+        logging.error("❌ JSON Parsing Error - Invalid JSON Response")
+        return None
+    except Exception as e:
+        logging.error(f"❌ Unexpected Exception: {str(e)}")
+        return None
+
+
+
