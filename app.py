@@ -1,20 +1,24 @@
 import os
+import pandas as pd  # Add this at the top if you haven't
+import csv
 import uuid
 import requests
+from io import StringIO
 import redis
 import logging
+import glob
 import json
 import time
-from flask import Flask, session, redirect, request, jsonify
+from flask import Flask, session, redirect, request, jsonify, send_file
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from dotenv import load_dotenv
 from datetime import timedelta, datetime  # Instead of `import datetime`
 from flask_cors import CORS
-from models import db, AmazonOAuthTokens, AmazonOrders, AmazonSettlementData,AmazonOrderItem  # Use the correct class name
+from models import db, AmazonOAuthTokens, AmazonOrders, AmazonSettlementData,AmazonOrderItem, AmazonFinancialShipmentEvent, AmazonInventoryItem  # Use the correct class name
 import psycopg2
 from psycopg2.extras import execute_values
-from amazon_api import fetch_orders_from_amazon, fetch_fba_fees_report, fetch_order_items, request_sales_and_fees_report, download_fba_fee_report, sync_fba_fees_last_year  # Adjust module name if needed
+from amazon_api import fetch_orders_from_amazon,  fetch_order_items, sync_settlement_report, fetch_and_preview_latest_settlement_report, get_presigned_settlement_url, save_settlement_report_to_v2_table, request_all_listings_report, download_listings_report, list_financial_event_groups, fetch_order_address, request_unsuppressed_inventory_report,download_inventory_report_file, save_unsuppressed_inventory_to_db, get_report_document_id   #Adjust module name if needed
 
 # Load environment variables
 load_dotenv()
@@ -98,7 +102,7 @@ def exchange_auth_code_for_tokens(auth_code):
     else:
         print(f"❌ Error fetching tokens: {response.text}")
         return None
-
+ 
 def get_stored_tokens(selling_partner_id):
     token_entry = AmazonOAuthTokens.query.filter_by(selling_partner_id=selling_partner_id).first()
     if not token_entry:
@@ -186,6 +190,13 @@ def store_orders_in_db(selling_partner_id, orders):
         asin = None
         seller_sku = None
 
+        # ✅ Extract shipping address
+        shipping_address = order.get("ShippingAddress", {})
+        city = shipping_address.get("City")
+        state = shipping_address.get("StateOrRegion")
+        postal_code = shipping_address.get("PostalCode")
+        country_code = shipping_address.get("CountryCode")
+
         # ✅ Try to get ASIN and SKU from DB if the items exist
         first_item = AmazonOrderItem.query.filter_by(amazon_order_id=amazon_order_id).first()
         if first_item:
@@ -210,7 +221,12 @@ def store_orders_in_db(selling_partner_id, orders):
                 shipping_price=shipping_price,
                 asin=asin,
                 seller_sku=seller_sku,
-                created_at=datetime.utcnow()
+                created_at=datetime.utcnow(),
+                city=city,
+                state=state,
+                postal_code=postal_code,
+                country_code=country_code
+
             )
 
             db.session.add(new_order)
@@ -219,7 +235,7 @@ def store_orders_in_db(selling_partner_id, orders):
     db.session.commit()
     print(f"✅ {saved_count} FBA orders saved to database with Amazon fees, shipping, ASIN & SKU.")
 
-
+ 
 
 @app.route('/start-oauth')
 def start_oauth():
@@ -232,43 +248,212 @@ def start_oauth():
     f"?application_id={APP_ID}"
     f"&state={state}"
     f"&redirect_uri={REDIRECT_URI}"
-    f"&scope=advertising::campaign_management"
+    f"&scope=sellingpartnerapi::notifications"
     f"&version=beta"
 )
+
 
 
     print(f"🔗 OAuth Redirect URL: {oauth_url}")
     return redirect(oauth_url)
 
 
-
-@app.route('/callback')
+@app.route("/callback")
 def callback():
-    """Handles Amazon OAuth callback and stores access tokens."""
-    auth_code = request.args.get("spapi_oauth_code")
-    selling_partner_id = request.args.get("selling_partner_id")
-    if not auth_code or not selling_partner_id:
-        return jsonify({"error": "Missing auth_code or selling_partner_id"}), 400
-    print(f"🚀 Received auth_code: {auth_code}")
-    print(f"🔍 Received selling_partner_id: {selling_partner_id}")
-    # Exchange auth code for access & refresh tokens
-    token_payload = {
-        "grant_type": "authorization_code",
-        "code": auth_code,
-        "client_id": LWA_APP_ID,
-        "client_secret": LWA_CLIENT_SECRET
-    }
-    token_response = requests.post(TOKEN_URL, data=token_payload)
-    token_data = token_response.json()
-    if "access_token" in token_data and "refresh_token" in token_data:
+    from models import db, Client, MarketplaceParticipation
+    from amazon_api import fetch_marketplaces_for_seller
+    import requests
+
+    try:
+        auth_code = request.args.get("spapi_oauth_code")
+        selling_partner_id = request.args.get("selling_partner_id")
+        state = request.args.get("state")  # Optional for CSRF protection
+
+        print(f"🚀 Received auth_code: {auth_code}")
+        print(f"🔍 Received selling_partner_id: {selling_partner_id}")
+
+        if not auth_code or not selling_partner_id:
+            return jsonify({"error": "Missing required parameters."}), 400
+
+        # Step 1: Exchange auth_code for access_token
+        token_data = exchange_auth_code_for_tokens(auth_code)
+        if not token_data:
+            return jsonify({"error": "Failed to exchange authorization code."}), 500
+
+        # Step 2: Save tokens to AmazonOAuthTokens
         save_oauth_tokens(
             selling_partner_id,
             token_data["access_token"],
             token_data["refresh_token"],
             token_data["expires_in"]
         )
-        return redirect(f"https://guillermos-amazing-site-b0c75a.webflow.io/dashboard")
-    return jsonify({"error": "Failed to obtain tokens", "details": token_data}), 400
+        print(f"✅ Tokens saved successfully for {selling_partner_id}")
+
+        # Step 3: Create or find Client
+        client = Client.query.filter_by(selling_partner_id=selling_partner_id).first()
+        if not client:
+            client = Client(
+                selling_partner_id=selling_partner_id,
+                access_token=token_data["access_token"],
+                refresh_token=token_data["refresh_token"],
+                region="na"  # Adjust if needed
+            )
+            db.session.add(client)
+            db.session.commit()
+            print(f"✅ New Client created for {selling_partner_id}")
+        else:
+            print(f"✅ Existing Client found for {selling_partner_id}")
+
+        # Step 4: Fetch and Save Marketplaces
+        try:
+            marketplaces = fetch_marketplaces_for_seller(token_data["access_token"])
+
+            if marketplaces:
+                for marketplace in marketplaces:
+                    existing = MarketplaceParticipation.query.filter_by(
+                        client_id=client.id,
+                        selling_partner_id=selling_partner_id,
+                        marketplace_id=marketplace["marketplace_id"]
+                    ).first()
+
+                    if not existing:
+                        new_marketplace = MarketplaceParticipation(
+                            client_id=client.id,
+                            selling_partner_id=selling_partner_id,
+                            marketplace_id=marketplace["marketplace_id"],
+                            country_code=marketplace["country_code"],
+                            is_participating=True
+                        )
+                        db.session.add(new_marketplace)
+
+                db.session.commit()
+                print(f"✅ Saved {len(marketplaces)} marketplaces for {selling_partner_id}")
+
+            else:
+                print(f"⚠️ No marketplaces returned for {selling_partner_id}")
+
+        except Exception as e:
+            print(f"❌ Error fetching marketplaces: {str(e)}")
+
+        # Step 5: Optionally trigger /api/start-data-fetch
+        try:
+            requests.post(
+                "https://render-webflow-restless-river-7629.fly.dev/api/start-data-fetch",
+                json={"selling_partner_id": selling_partner_id},
+                timeout=5
+            )
+            print("✅ Data fetching triggered successfully!")
+        except Exception as e:
+            print(f"⚠️ Failed to trigger start-data-fetch: {e}")
+
+        # 🚀 Step 6: Redirect to dashboard WITH selling_partner_id
+        return redirect(f"https://guillermos-amazing-site-b0c75a.webflow.io/dashboard?selling_partner_id={selling_partner_id}")
+
+    except Exception as e:
+        print(f"❌ Error in callback: {str(e)}")
+        return jsonify({"error": "Internal server error."}), 500
+
+
+
+@app.route('/api/start-data-fetch', methods=["POST"])
+def start_data_fetch():
+    from amazon_api import (
+        fetch_orders_from_amazon,
+        fetch_order_items,
+        save_shipment_events_by_group,
+        list_financial_event_groups,
+        get_marketplace_id_for_seller
+    )
+    from models import db, AmazonOrders, AmazonOrderItem, AmazonFinancialShipmentEvent
+    from app import store_order_items_in_db  # ⬅️ Make sure this matches where it's defined
+
+    data = request.get_json()
+    selling_partner_id = data.get("selling_partner_id")
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return jsonify({"error": "No access token found"}), 401
+
+    try:
+        print(f"🚀 Starting full data fetch for {selling_partner_id}...")
+
+        marketplace_id = get_marketplace_id_for_seller(selling_partner_id)
+        if not marketplace_id:
+            return jsonify({"error": "No marketplace_id found"}), 400
+
+        one_year_ago = (datetime.utcnow() - timedelta(days=365)).isoformat()
+
+        # 1️⃣ Fetch and store orders
+        orders = fetch_orders_from_amazon(selling_partner_id, access_token, one_year_ago)
+        if orders:
+            for order in orders:
+                amazon_order_id = order["AmazonOrderId"]
+                existing = AmazonOrders.query.filter_by(amazon_order_id=amazon_order_id).first()
+                if not existing:
+                    db.session.add(AmazonOrders(
+                        selling_partner_id=selling_partner_id,
+                        order_id=amazon_order_id,
+                        amazon_order_id=amazon_order_id,
+                        purchase_date=order.get("PurchaseDate"),
+                        order_status=order.get("OrderStatus"),
+                        marketplace_id=order.get("MarketplaceId"),
+                        number_of_items_shipped=order.get("NumberOfItemsShipped", 0),
+                        total_amount=order.get("OrderTotal", {}).get("Amount"),
+                        currency=order.get("OrderTotal", {}).get("CurrencyCode"),
+                        city=order.get("ShippingAddress", {}).get("City"),
+                        state=order.get("ShippingAddress", {}).get("StateOrRegion"),
+                        postal_code=order.get("ShippingAddress", {}).get("PostalCode"),
+                        country_code=order.get("ShippingAddress", {}).get("CountryCode")
+                    ))
+            db.session.commit()
+            print(f"✅ Stored {len(orders)} orders.")
+        else:
+            print("⚠️ No orders found.")
+
+        # 2️⃣ Fetch order items for those orders
+        one_year_ago_dt = datetime.utcnow() - timedelta(days=365)
+        recent_orders = AmazonOrders.query.filter(
+            AmazonOrders.selling_partner_id == selling_partner_id,
+            AmazonOrders.purchase_date >= one_year_ago_dt
+        ).all()
+
+        item_count = 0
+        for order in recent_orders:
+            amazon_order_id = order.amazon_order_id
+            print(f"📦 Fetching items for order {amazon_order_id}")
+            try:
+                order_items = fetch_order_items(access_token, amazon_order_id)
+                if order_items:
+                    store_order_items_in_db(selling_partner_id, {
+                        "amazon_order_id": amazon_order_id,
+                        "order_items": order_items
+                    })
+                    item_count += len(order_items)
+                else:
+                    print(f"⚠️ No items returned for {amazon_order_id}")
+            except Exception as e:
+                print(f"❌ Failed to fetch items for {amazon_order_id}: {e}")
+                continue
+
+        print(f"✅ Saved {item_count} order items.")
+
+        # 3️⃣ Fetch shipment events
+        financial_groups = list_financial_event_groups(access_token)
+        if financial_groups:
+            for group in financial_groups.get("payload", {}).get("FinancialEventGroupList", []):
+                group_id = group.get("FinancialEventGroupId")
+                if group_id:
+                    save_shipment_events_by_group(access_token, selling_partner_id, group_id)
+
+        print(f"✅ Finished full data sync for {selling_partner_id}")
+        return jsonify({"message": "✅ Data fetching and saving completed."})
+
+    except Exception as e:
+        db.session.rollback()
+        print(f"❌ Error during start-data-fetch: {e}")
+        return jsonify({"error": "Failed to fetch data."}), 500
 
 
 
@@ -363,6 +548,7 @@ def log_response(response):
 
 
 
+
 def store_order_items_in_db(selling_partner_id, order_data):
     """Save order items using SQLAlchemy ORM."""
 
@@ -413,7 +599,6 @@ def store_order_items_in_db(selling_partner_id, order_data):
     except Exception as e:
         db.session.rollback()
         print(f"❌ Error saving order items to DB: {e}")
-
 
 
 
@@ -531,11 +716,11 @@ def get_order_items_for_dashboard():
                 "shipping_price": float(item.shipping_price or 0),
                 "amazon_fees": float(item.item_tax or 0) + float(item.shipping_tax or 0),
                 "cogs": float(item.cogs or 0),
-                "margin": compute_margin(item)
+                "margin": compute_margin(item),
+                "image_url": item.image_url or f"https://render-webflow-restless-river-7629.fly.dev/images/{item.asin}.jpg"
             })
 
     return jsonify(unique_items)
-
 
 
 
@@ -550,7 +735,6 @@ def get_dashboard_data():
 
     orders_query = AmazonOrders.query.filter_by(selling_partner_id=selling_partner_id)
 
-    # Apply date filters
     if start_date:
         try:
             start_date_obj = datetime.strptime(start_date, "%Y-%m-%d")
@@ -567,7 +751,7 @@ def get_dashboard_data():
 
     orders = orders_query.all()
 
-    # Aggregate shipping from related order items
+    # 🚚 Shipping by order
     shipping_map = {}
     for order in orders:
         shipping_price = sum(
@@ -576,7 +760,7 @@ def get_dashboard_data():
         )
         shipping_map[order.amazon_order_id] = shipping_price
 
-    # Financial calculations
+    # 💰 Card metrics
     order_total_sales = sum(float(order.total_amount or 0) for order in orders)
     shipping_total = sum(shipping_map.values())
     total_sales = order_total_sales + shipping_total
@@ -589,6 +773,31 @@ def get_dashboard_data():
     revenue = total_sales
     roi = ((revenue - total_cogs - total_fees) / (total_cogs + total_fees + 1e-5)) * 100
 
+    # 🔗 JOIN shipment events + order items
+    joined_data = db.session.query(
+        AmazonFinancialShipmentEvent,
+        AmazonOrderItem.asin,
+        AmazonOrderItem.title,
+        AmazonOrderItem.cogs
+    ).outerjoin(
+        AmazonOrderItem,
+        (AmazonFinancialShipmentEvent.order_id == AmazonOrderItem.amazon_order_id) &
+        (AmazonFinancialShipmentEvent.sku == AmazonOrderItem.seller_sku)
+    ).filter(
+        AmazonFinancialShipmentEvent.selling_partner_id == selling_partner_id,
+        AmazonFinancialShipmentEvent.posted_date.isnot(None)
+    ).all()
+
+    # 📦 Format joined results
+    shipment_events = []
+    for event, asin, title, cogs in joined_data:
+        data = event.to_dict()
+        data["asin"] = asin
+        data["title"] = title
+        data["cogs"] = float(cogs) if cogs is not None else None
+        shipment_events.append(data)
+
+    # 🚀 Final response
     return jsonify({
         "cards": {
             "total_sales": round(total_sales, 2),
@@ -602,25 +811,483 @@ def get_dashboard_data():
                 "shipping_price": round(shipping_map.get(order.amazon_order_id, 0), 2)
             }
             for order in orders
-        ]
+        ],
+        "shipment_events": shipment_events
     })
 
 
 
-@app.route("/api/fba-fees-report", methods=["GET"])
-def trigger_fba_fees_report():
+
+
+
+@app.route("/api/settlement-report")
+def run_settlement_report():
+    selling_partner_id = request.args.get("selling_partner_id")
+    
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    access_token = get_stored_tokens(selling_partner_id)
+
+    if not access_token:
+        return jsonify({"message": "❌ No access token found. Please check your credentials."}), 401
+
+    file_path = sync_settlement_report(selling_partner_id, access_token)
+    if file_path:
+        try:
+            with open(file_path, "r") as f:
+                preview = f.read(2000)  # Preview first 2000 characters
+            return jsonify({
+                "message": "✅ Report downloaded",
+                "preview": preview,
+                "file_path": file_path
+            })
+        except Exception as e:
+            return jsonify({"error": f"Failed to read file: {str(e)}"}), 500
+    else:
+        return jsonify({"message": "❌ Failed to download settlement report"}), 500
+
+
+
+@app.route("/api/access-token")
+def get_access_token_for_partner():
     selling_partner_id = request.args.get("selling_partner_id")
     if not selling_partner_id:
         return jsonify({"error": "Missing selling_partner_id"}), 400
 
     access_token = get_stored_tokens(selling_partner_id)
     if not access_token:
-        return jsonify({"error": "Unable to retrieve access token"}), 401
+        return jsonify({"error": "No access token found or token is invalid"}), 404
 
-    from amazon_api import sync_fba_fees_last_year
-    file_path = sync_fba_fees_last_year(selling_partner_id, access_token)
+    return jsonify({"access_token": access_token})
 
+
+
+
+
+@app.route("/api/preview-settlement-report")
+def preview_settlement():
+    url = request.args.get("url")
+    if not url:
+        return {"message": "❌ Missing pre-signed URL"}
+
+    from amazon_api import preview_settlement_report_from_url
+    preview = preview_settlement_report_from_url(url)
+
+    if preview is None:
+        return {"message": "❌ Could not preview report"}
+
+    return preview.to_json(orient="records")
+
+
+
+
+@app.route("/api/settlement-preview")
+def preview_settlement_report():
+    selling_partner_id = request.args.get("selling_partner_id")
+    document_id = request.args.get("document_id")
+
+    if not selling_partner_id or not document_id:
+        return {"message": "❌ Missing parameters"}, 400
+
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return {"message": "❌ No access token found"}, 400
+
+    preview = fetch_and_preview_latest_settlement_report(access_token, document_id)
+    if preview:
+        return jsonify(preview)
+    else:
+        return {"message": "❌ Could not preview report"}, 500
+
+
+
+@app.route("/api/settlement-save", methods=["POST"])
+def save_settlement_report():
+    selling_partner_id = request.args.get("selling_partner_id")
+    document_id = request.args.get("document_id")
+
+    if not selling_partner_id or not document_id:
+        return {"message": "❌ Missing parameters"}, 400
+
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return {"message": "❌ No access token found"}, 400
+
+    url = get_presigned_settlement_url(access_token, document_id)
+    if not url:
+        return {"message": "❌ Failed to fetch document URL"}, 500
+
+    response = requests.get(url)
+    if response.status_code != 200:
+        return {"message": "❌ Failed to download settlement report"}, 500
+
+    save_settlement_report_to_v2_table(response.content.decode("utf-8"), selling_partner_id)
+    return {"message": "✅ Settlement report saved"}
+
+
+
+
+@app.route("/api/request-listings-report", methods=["GET"])
+def trigger_all_listings_report():
+    from amazon_api import request_all_listings_report
+
+    selling_partner_id = request.args.get("selling_partner_id")
+    if not selling_partner_id:
+        return {"message": "❌ Missing selling_partner_id"}, 400
+
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return {"message": "❌ No access token found"}, 401
+
+    report = request_all_listings_report(access_token)
+    if report:
+        return jsonify(report)
+    else:
+        return {"message": "❌ Failed to request listings report"}, 500
+    
+
+
+@app.route("/api/download-listings-report", methods=["GET"])
+def download_listings_report_csv():
+    """
+    Downloads the Merchant Listings All Data report (using the reportId) and sends
+    it as a downloadable CSV file.
+    """
+    selling_partner_id = request.args.get("selling_partner_id")
+    report_id = request.args.get("report_id")
+    
+    if not selling_partner_id or not report_id:
+        return jsonify({"error": "Missing selling_partner_id or report_id"}), 400
+
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return jsonify({"error": "No access token found"}), 400
+
+    from amazon_api import download_listings_report
+    file_path = download_listings_report(report_id, access_token)
     if not file_path:
-        return jsonify({"error": "Failed to fetch report"}), 500
+        return jsonify({"error": "Failed to download listings report"}), 500
 
-    return jsonify({"message": "✅ FBA Fees Report downloaded", "file_path": file_path})
+    return send_file(file_path, as_attachment=True)
+
+
+
+@app.route("/api/simulate-fba-fee", methods=["GET"])
+def simulate_fba_fulfillment_fee():
+    from amazon_api import get_dimensions_by_asin
+
+    selling_partner_id = request.args.get("selling_partner_id")
+    asin = request.args.get("asin")
+
+    if not selling_partner_id or not asin:
+        return jsonify({"error": "Missing asin or selling_partner_id"}), 400
+
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return jsonify({"error": "Access token not found"}), 401
+
+    # Step 1: Get product dimensions and weight
+    dimensions = get_dimensions_by_asin(access_token, asin)
+    if not dimensions:
+        return jsonify({"error": "Could not fetch dimensions from Amazon"}), 500
+
+    length = dimensions.get("length_cm")
+    width = dimensions.get("width_cm")
+    height = dimensions.get("height_cm")
+    weight_kg = dimensions.get("weight_kg")
+
+    if not all([length, width, height, weight_kg]):
+        return jsonify({
+            "error": "Missing one or more values for length, width, height, or weight",
+            "dimensions": dimensions
+        }), 400
+
+    # Step 2: Estimate dimensional weight
+    dim_weight = (length * width * height) / 5000
+    billable_weight = max(weight_kg, dim_weight)
+
+    # Step 3: Estimate FBA fulfillment fee (MX rough tiers)
+    if billable_weight <= 0.2:
+        fba_fee = 57
+        tier = "Small Standard"
+    elif billable_weight <= 0.5:
+        fba_fee = 72
+        tier = "Large Standard"
+    elif billable_weight <= 1.0:
+        fba_fee = 90
+        tier = "Standard Heavy"
+    else:
+        fba_fee = 90 + ((billable_weight - 1.0) * 20)
+        tier = "Oversize or Heavy"
+
+    return jsonify({
+        "asin": asin,
+        "tier": tier,
+        "fba_fee_mxn": round(fba_fee, 2),
+        "billable_weight_kg": round(billable_weight, 3),
+        "actual_weight_kg": round(weight_kg, 3),
+        "dim_weight_kg": round(dim_weight, 3),
+        "dimensions_cm": {
+            "length": length,
+            "width": width,
+            "height": height
+        }
+    })
+
+
+
+@app.route("/api/financial-events/group", methods=["GET"])
+def financial_events_by_group():
+    selling_partner_id = request.args.get("selling_partner_id")
+    group_id = request.args.get("group_id")
+
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return {"error": "No access token"}, 401
+
+    from amazon_api import get_financial_events_by_group
+    events = get_financial_events_by_group(access_token, group_id)
+    return jsonify(events or {"error": "Failed to retrieve events"})
+
+
+
+@app.route("/download/financial-group/<group_id>", methods=["GET"])
+def download_financial_group(group_id):
+    file_path = f"financial_event_reports/group_{group_id}.json"
+    if os.path.exists(file_path):
+        return send_file(file_path, as_attachment=True)
+    else:
+        return {"error": "File not found"}, 404
+
+
+
+# Endpoint: Financial Events by Order
+@app.route("/api/financial-events/order", methods=["GET"])
+def financial_events_by_order():
+    selling_partner_id = request.args.get("selling_partner_id")
+    order_id = request.args.get("order_id")
+
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return {"error": "No access token"}, 401
+
+    from amazon_api import get_financial_events_by_order
+    events = get_financial_events_by_order(access_token, order_id)
+    return jsonify(events or {"error": "Failed to retrieve events"})
+
+
+# Endpoint: Financial Events by Date Range
+@app.route("/api/financial-events/date-range", methods=["GET"])
+def financial_events_by_date_range():
+    selling_partner_id = request.args.get("selling_partner_id")
+    start_date = request.args.get("start_date")  # Example: 2024-12-01T00:00:00Z
+    end_date = request.args.get("end_date")      # Example: 2024-12-31T23:59:59Z
+
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return {"error": "No access token"}, 401
+
+    from amazon_api import get_financial_events_by_date_range
+    events = get_financial_events_by_date_range(access_token, start_date, end_date)
+    return jsonify(events or {"error": "Failed to retrieve events"})
+
+
+
+@app.route("/api/financial-events/groups", methods=["GET"])
+def list_event_groups():
+    selling_partner_id = request.args.get("selling_partner_id")
+    start_date = request.args.get("start_date")  # Optional: 2024-12-01T00:00:00Z
+    end_date = request.args.get("end_date")      # Optional: 2024-12-31T23:59:59Z
+
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return {"error": "No access token"}, 401
+
+    from amazon_api import list_financial_event_groups
+    groups = list_financial_event_groups(access_token, start_date, end_date)
+    return jsonify(groups or {"error": "Failed to fetch event groups"})
+
+
+
+
+@app.route("/api/fetch-and-save-fba-events", methods=["GET"])
+def fetch_and_save_fba_events():
+    from amazon_api import list_financial_event_groups, save_shipment_events_by_group
+
+    selling_partner_id = request.args.get("selling_partner_id")
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return {"error": "Access token not found"}, 401
+
+    # Obtener los grupos de los últimos 365 días
+    start_date = (datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_date = (datetime.utcnow() - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    group_data = list_financial_event_groups(access_token, start_date, end_date)
+    group_list = group_data.get("payload", {}).get("FinancialEventGroupList", [])
+
+    saved_groups = 0
+
+    for group in group_list:
+        group_id = group.get("FinancialEventGroupId")
+        if group_id:
+            save_shipment_events_by_group(access_token, selling_partner_id, group_id)
+            saved_groups += 1
+
+    return {"message": f"✅ Guardado exitoso de eventos de envío para {saved_groups} grupos"}
+
+
+
+
+from sqlalchemy.orm import aliased
+from models import AmazonFinancialShipmentEvent, AmazonOrderItem
+
+@app.route("/api/joined-financial-events", methods=["GET"])
+def get_joined_financial_data():
+    selling_partner_id = request.args.get("selling_partner_id")
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    # Perform the join
+    results = (
+        db.session.query(
+            AmazonFinancialShipmentEvent,
+            AmazonOrderItem.asin,
+            AmazonOrderItem.title,
+            AmazonOrderItem.cogs
+        )
+        .outerjoin(
+            AmazonOrderItem,
+            (AmazonFinancialShipmentEvent.order_id == AmazonOrderItem.amazon_order_id) &
+            (AmazonFinancialShipmentEvent.sku == AmazonOrderItem.seller_sku)
+        )
+        .filter(AmazonFinancialShipmentEvent.selling_partner_id == selling_partner_id)
+        .all()
+    )
+
+    # Format results
+    joined_data = []
+    for event, asin, title, cogs in results:
+        row = event.to_dict()
+        row["asin"] = asin
+        row["title"] = title
+        row["cogs"] = float(cogs) if cogs else None
+        joined_data.append(row)
+
+    return jsonify(joined_data)
+
+
+
+@app.route("/api/inventory-report", methods=["GET"])
+def inventory_report():
+    selling_partner_id = request.args.get("selling_partner_id")
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return jsonify({"error": "No access token found"}), 401
+
+    # Step 1: Request the Inventory Report
+    report_id = request_unsuppressed_inventory_report(access_token, selling_partner_id)
+    if not report_id:
+        return jsonify({"error": "Failed to request inventory report"}), 500
+
+    # Step 2: Poll until report is DONE and get documentId
+    document_id = get_report_document_id(report_id, access_token)
+    if not document_id:
+        return jsonify({"error": "Failed to retrieve documentId for report"}), 500
+
+    # Step 3: Download the Inventory Report File
+    file_path = download_inventory_report_file(document_id, access_token)
+    if not file_path:
+        return jsonify({"error": "Failed to download inventory report file"}), 500
+
+    # Step 4: Save Inventory Data to Database
+    save_unsuppressed_inventory_to_db(file_path, selling_partner_id)
+
+    # Step 5: Respond
+    return jsonify({"message": "✅ Inventory data saved", "file_path": file_path})
+
+
+
+
+@app.route("/update-order-addresses", methods=["POST"])
+def update_order_addresses():
+    selling_partner_id = request.json.get("selling_partner_id")
+    access_token = get_stored_tokens(selling_partner_id)
+
+    orders = AmazonOrders.query.filter(
+        AmazonOrders.selling_partner_id == selling_partner_id,
+        AmazonOrders.state == None  # Only update orders with missing state
+    ).all()
+
+    updated = 0
+    for order in orders:
+        address = fetch_order_address(access_token, order.order_id)
+        if address:
+            order.state = address.get("StateOrRegion")
+            order.city = address.get("City")
+            order.postal_code = address.get("PostalCode")
+            order.country_code = address.get("CountryCode")
+            updated += 1
+
+    db.session.commit()
+    return jsonify({"updated": updated})
+
+
+@app.route("/api/order-locations", methods=["GET"])
+def get_order_locations():
+    selling_partner_id = request.args.get("selling_partner_id")
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    orders = AmazonOrders.query.filter_by(selling_partner_id=selling_partner_id).all()
+
+    location_counts = {}
+    for order in orders:
+        state = order.state or "Unknown"
+        location_counts[state] = location_counts.get(state, 0) + 1
+
+    return jsonify([
+        {"location": state, "order_count": count}
+        for state, count in location_counts.items()
+    ])
+
+
+
+import requests
+from flask import Response
+
+@app.route("/images/<asin>.jpg")
+def proxy_amazon_image(asin):
+    url = f"https://images-na.ssl-images-amazon.com/images/P/{asin}.jpg"
+    try:
+        r = requests.get(url, stream=True)
+        if r.status_code == 200:
+            return Response(r.content, mimetype="image/jpeg")
+        else:
+            return "Image not found", 404
+    except Exception as e:
+        return f"Error fetching image: {str(e)}", 500
+
+
+
+
+@app.route("/api/fba-inventory-save", methods=["GET"])
+def save_fba_unsuppressed_inventory():
+    from amazon_api import sync_unsuppressed_inventory_report
+
+    selling_partner_id = request.args.get("selling_partner_id")
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    try:
+        file_path = sync_unsuppressed_inventory_report(selling_partner_id)
+        if file_path:
+            return jsonify({"message": "✅ Inventory saved", "file_path": file_path})
+        else:
+            return jsonify({"error": "❌ Failed to save inventory"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
