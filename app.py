@@ -18,7 +18,7 @@ from flask_cors import CORS
 from models import db, AmazonOAuthTokens, AmazonOrders, AmazonSettlementData,AmazonOrderItem, AmazonFinancialShipmentEvent, AmazonInventoryItem  # Use the correct class name
 import psycopg2
 from psycopg2.extras import execute_values
-from amazon_api import fetch_orders_from_amazon,  fetch_order_items, sync_settlement_report, fetch_and_preview_latest_settlement_report, get_presigned_settlement_url, save_settlement_report_to_v2_table, request_all_listings_report, download_listings_report, list_financial_event_groups, fetch_order_address, request_unsuppressed_inventory_report,download_inventory_report_file, save_unsuppressed_inventory_to_db, get_report_document_id   #Adjust module name if needed
+from amazon_api import fetch_orders_from_amazon,  fetch_order_items, sync_settlement_report, fetch_and_preview_latest_settlement_report, get_presigned_settlement_url, save_settlement_report_to_v2_table, request_all_listings_report, download_listings_report, list_financial_event_groups, fetch_order_address, download_inventory_report_file, save_unsuppressed_inventory_to_db, get_report_document_id, save_unsuppressed_inventory_report, generate_merchant_listings_report,request_returns_report, get_marketplace_id_for_seller  #Adjust module name if needed
 
 # Load environment variables
 load_dotenv()
@@ -548,10 +548,8 @@ def log_response(response):
 
 
 
-
 def store_order_items_in_db(selling_partner_id, order_data):
-    """Save order items using SQLAlchemy ORM."""
-
+    """Save order items using SQLAlchemy ORM with marketplace name."""
     amazon_order_id = order_data.get("amazon_order_id")
     order_items = order_data.get("order_items", [])
 
@@ -559,9 +557,24 @@ def store_order_items_in_db(selling_partner_id, order_data):
         print("⚠️ No order items to save.")
         return
 
-    # ✅ Fetch the purchase_date from the AmazonOrders table
+    # ✅ Fetch the related order to get purchase_date and marketplace_id
     order_record = AmazonOrders.query.filter_by(amazon_order_id=amazon_order_id).first()
     purchase_date = order_record.purchase_date if order_record else None
+    marketplace_id = order_record.marketplace_id if order_record else None
+
+    # ✅ Map marketplace_id to human-friendly name
+    marketplace_map = {
+        "A1AM78C64UM0Y8": "Amazon.com.mx",
+        "ATVPDKIKX0DER": "Amazon.com",
+        "A1PA6795UKMFR9": "Amazon.de",
+        "A1RKKUPIHCS9HS": "Amazon.es",
+        "A1F83G8C2ARO7P": "Amazon.co.uk",
+        "A21TJRUUN4KGV": "Amazon.in",
+        "A1VC38T7YXB528": "Amazon.co.jp",
+        "AAHKV2X7AFYLW": "Amazon.cn",
+        "APJ6JRA9NG5V4": "Amazon.ca"
+    }
+    marketplace_name = marketplace_map.get(marketplace_id, marketplace_id)
 
     try:
         for item in order_items:
@@ -587,8 +600,9 @@ def store_order_items_in_db(selling_partner_id, order_data):
                 item_tax=float(item.get("ItemTax", 0) or 0),
                 shipping_price=float(item.get("ShippingPrice", 0) or 0),
                 shipping_tax=float(item.get("ShippingTax", 0) or 0),
-                purchase_date=purchase_date,  # ✅ This line was missing
-                created_at=datetime.utcnow()
+                purchase_date=purchase_date,
+                created_at=datetime.utcnow(),
+                marketplace=marketplace_name  # ✅ Human-readable marketplace name
             )
 
             db.session.add(new_item)
@@ -624,6 +638,49 @@ def update_cogs():
     return jsonify({"message": f"✅ COGS updated for seller_sku {seller_sku}"}), 200
 
 
+
+@app.route("/api/update-safety-stock", methods=["POST"])
+def update_safety_stock():
+    data = request.json
+    seller_sku = data.get("seller_sku")
+    safety_stock = data.get("safety_stock")
+
+    if not seller_sku or safety_stock is None:
+        return jsonify({"error": "Missing seller_sku or safety_stock"}), 400
+
+    items = AmazonOrderItem.query.filter_by(seller_sku=seller_sku).all()
+
+    if not items:
+        return jsonify({"error": f"No items found for seller_sku: {seller_sku}"}), 404
+
+    for item in items:
+        item.safety_stock = safety_stock
+
+    db.session.commit()
+    return jsonify({"message": f"✅ Safety Stock updated for seller_sku {seller_sku}"}), 200
+
+
+
+@app.route("/api/update-time-delivery", methods=["POST"])
+def update_time_delivery():
+    data = request.json
+    seller_sku    = data.get("seller_sku")
+    time_delivery = data.get("time_delivery")
+
+    if not seller_sku or time_delivery is None:
+        return jsonify({"error": "Missing seller_sku or time_delivery"}), 400
+
+    items = AmazonOrderItem.query.filter_by(seller_sku=seller_sku).all()
+    if not items:
+        return jsonify({"error": f"No items found for seller_sku: {seller_sku}"}), 404
+
+    for item in items:
+        item.time_delivery = time_delivery
+
+    db.session.commit()
+    return jsonify({
+        "message": f"✅ Time Delivery updated for seller_sku {seller_sku}"
+    }), 200
 
 
 
@@ -717,10 +774,12 @@ def get_order_items_for_dashboard():
                 "amazon_fees": float(item.item_tax or 0) + float(item.shipping_tax or 0),
                 "cogs": float(item.cogs or 0),
                 "margin": compute_margin(item),
-                "image_url": item.image_url or f"https://render-webflow-restless-river-7629.fly.dev/images/{item.asin}.jpg"
+                "image_url": item.image_url or f"https://render-webflow-restless-river-7629.fly.dev/images/{item.asin}.jpg",
+                "marketplace": item.marketplace or "Unknown"  # ✅ added marketplace here
             })
 
     return jsonify(unique_items)
+
 
 
 
@@ -1077,6 +1136,7 @@ def financial_events_by_order():
     return jsonify(events or {"error": "Failed to retrieve events"})
 
 
+
 # Endpoint: Financial Events by Date Range
 @app.route("/api/financial-events/date-range", methods=["GET"])
 def financial_events_by_date_range():
@@ -1179,39 +1239,6 @@ def get_joined_financial_data():
 
 
 
-@app.route("/api/inventory-report", methods=["GET"])
-def inventory_report():
-    selling_partner_id = request.args.get("selling_partner_id")
-    if not selling_partner_id:
-        return jsonify({"error": "Missing selling_partner_id"}), 400
-
-    access_token = get_stored_tokens(selling_partner_id)
-    if not access_token:
-        return jsonify({"error": "No access token found"}), 401
-
-    # Step 1: Request the Inventory Report
-    report_id = request_unsuppressed_inventory_report(access_token, selling_partner_id)
-    if not report_id:
-        return jsonify({"error": "Failed to request inventory report"}), 500
-
-    # Step 2: Poll until report is DONE and get documentId
-    document_id = get_report_document_id(report_id, access_token)
-    if not document_id:
-        return jsonify({"error": "Failed to retrieve documentId for report"}), 500
-
-    # Step 3: Download the Inventory Report File
-    file_path = download_inventory_report_file(document_id, access_token)
-    if not file_path:
-        return jsonify({"error": "Failed to download inventory report file"}), 500
-
-    # Step 4: Save Inventory Data to Database
-    save_unsuppressed_inventory_to_db(file_path, selling_partner_id)
-
-    # Step 5: Respond
-    return jsonify({"message": "✅ Inventory data saved", "file_path": file_path})
-
-
-
 
 @app.route("/update-order-addresses", methods=["POST"])
 def update_order_addresses():
@@ -1260,34 +1287,427 @@ def get_order_locations():
 import requests
 from flask import Response
 
-@app.route("/images/<asin>.jpg")
-def proxy_amazon_image(asin):
-    url = f"https://images-na.ssl-images-amazon.com/images/P/{asin}.jpg"
+@app.route("/proxy-image/<asin>")
+def proxy_image(asin):
+    url = f"https://ws-na.amazon-adsystem.com/widgets/q?_encoding=UTF8&ASIN={asin}&Format=_SL75_&ID=AsinImage"
     try:
-        r = requests.get(url, stream=True)
-        if r.status_code == 200:
-            return Response(r.content, mimetype="image/jpeg")
+        res = requests.get(url, timeout=10)
+        if res.status_code == 200:
+            return Response(res.content, content_type=res.headers['Content-Type'])
         else:
             return "Image not found", 404
     except Exception as e:
-        return f"Error fetching image: {str(e)}", 500
+        print(f"❌ Error fetching image for ASIN {asin}: {e}")
+        return "Error fetching image", 500
 
 
 
 
-@app.route("/api/fba-inventory-save", methods=["GET"])
-def save_fba_unsuppressed_inventory():
-    from amazon_api import sync_unsuppressed_inventory_report
+
+    
+
+
+
+@app.route("/api/inventory", methods=["GET"])
+def get_inventory():
+    selling_partner_id = request.args.get("selling_partner_id")
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    inventory_items = AmazonInventoryItem.query.filter_by(selling_partner_id=selling_partner_id).all()
+    items = []
+    for item in inventory_items:
+        items.append({
+            "sku": item.sku,
+            "asin": item.asin,
+            "product_name": item.product_name,
+            "quantity_available": item.quantity_available,
+            "image_url": f"https://render-webflow-restless-river-7629.fly.dev/images/{item.asin}.jpg" if item.asin else None
+        })
+    return jsonify(items)
+
+
+
+
+
+@app.route("/api/inventory-summary", methods=["GET"])
+def inventory_summary():
+    seller = request.args.get("selling_partner_id")
+    if not seller:
+        return jsonify([]), 400
+
+    items = AmazonInventoryItem.query.\
+      filter_by(selling_partner_id=seller).all()
+
+    cutoff = datetime.utcnow() - timedelta(days=30)
+    out = []
+
+    for inv in items:
+        # 1️⃣ Recent items for avg_30d_sales
+        recent = AmazonOrderItem.query.filter(
+            AmazonOrderItem.selling_partner_id == seller,
+            AmazonOrderItem.asin            == inv.asin,
+            AmazonOrderItem.purchase_date   >= cutoff
+        ).all()
+
+        total_qty   = sum(o.quantity_ordered or 0 for o in recent)
+        avg_30d     = round(total_qty / 30, 2)
+
+        # 2️⃣ Historic items for price/cogs fallback
+        all_hist = AmazonOrderItem.query.filter(
+            AmazonOrderItem.selling_partner_id == seller,
+            AmazonOrderItem.asin            == inv.asin
+        ).all()
+
+        if all_hist:
+            avg_price = round(sum(float(o.item_price or 0) for o in all_hist) / len(all_hist), 2)
+            avg_cogs  = round(sum(float(o.cogs or 0)        for o in all_hist) / len(all_hist), 2)
+        else:
+            avg_price = avg_cogs = 0
+
+        qty_avail = inv.quantity_available or 0
+
+        out.append({
+            "asin":                   inv.asin,
+            "sku":                    inv.sku,
+            "name":                   inv.product_name,
+            "quantity_available":     qty_avail,
+            "avg_30d_sales":          avg_30d,
+            "unit_price":             avg_price,
+            "cogs":                   avg_cogs,
+            "stock_value_unit_price": round(qty_avail * avg_price, 2),
+            "stock_value_cogs":       round(qty_avail * avg_cogs, 2),
+            "image_url": f"https://ws-na.amazon-adsystem.com/widgets/q?_encoding=UTF8&ASIN={inv.asin}&Format=_SL75_&ID=AsinImage"
+
+        })
+
+    return jsonify(out)
+
+
+
+
+
+
+
+
+
+
+
+@app.route("/api/save-unsuppressed-inventory", methods=["GET"])
+def trigger_save_unsuppressed_inventory():
+    from amazon_api import save_unsuppressed_inventory_report
 
     selling_partner_id = request.args.get("selling_partner_id")
     if not selling_partner_id:
         return jsonify({"error": "Missing selling_partner_id"}), 400
 
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return jsonify({"error": "No access token found"}), 401
+
     try:
-        file_path = sync_unsuppressed_inventory_report(selling_partner_id)
-        if file_path:
-            return jsonify({"message": "✅ Inventory saved", "file_path": file_path})
-        else:
-            return jsonify({"error": "❌ Failed to save inventory"}), 500
+        # This function should already exist and use the access_token internally
+        save_unsuppressed_inventory_report(access_token, selling_partner_id)
+        return jsonify({"message": f"✅ Inventory report saved for {selling_partner_id}"}), 200
+
     except Exception as e:
+        print(f"❌ Error saving inventory report: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+
+
+
+
+@app.route("/api/download-inventory-report", methods=["GET"])
+def download_inventory_report():
+    try:
+        selling_partner_id = request.args.get("selling_partner_id")
+        access_token = request.args.get("access_token")
+
+        if not selling_partner_id or not access_token:
+            return {"error": "Missing selling_partner_id or access_token"}, 400
+
+        print(f"📥 Generating report for {selling_partner_id}...")
+
+        # Step 1: Get reportDocumentId
+        document_id = generate_merchant_listings_report(access_token, selling_partner_id)
+
+        # Step 2: Get download URL
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "x-amz-access-token": access_token
+        }
+
+        doc_res = requests.get(
+            f"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/documents/{document_id}",
+            headers=headers
+        )
+        if doc_res.status_code != 200:
+            raise Exception(f"❌ Failed to get document: {doc_res.text}")
+
+        download_url = doc_res.json()["url"]
+        print("📎 Got download URL.")
+
+        download = requests.get(download_url)
+        try:
+            content = download.content.decode("utf-8")
+        except UnicodeDecodeError:
+            content = download.content.decode("latin-1")
+
+        # Step 3: Save as CSV on server
+        file_path = f"/tmp/inventory_{selling_partner_id}.csv"
+        with open(file_path, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+
+        print(f"✅ Report ready at {file_path}")
+        return send_file(file_path, as_attachment=True)
+
+    except Exception as e:
+        print(f"❌ Error in download_inventory_report: {e}")
+        return {"error": str(e)}, 500
+
+
+
+
+@app.route("/api/save-merged-inventory", methods=["GET"])
+def save_merged_inventory():
+    try:
+        selling_partner_id = request.args.get("selling_partner_id")
+        access_token = request.args.get("access_token")
+
+        if not selling_partner_id or not access_token:
+            return {"error": "Missing selling_partner_id or access_token"}, 400
+
+        from amazon_api import save_merged_inventory_report
+        save_merged_inventory_report(access_token, selling_partner_id)
+        return {"message": "✅ Inventory merged and saved successfully!"}
+
+    except Exception as e:
+        print(f"❌ Error in /api/save-merged-inventory: {e}")
+        return {"error": str(e)}, 500
+
+
+
+
+
+from flask import send_from_directory
+
+
+@app.route('/images/<asin>.jpg')
+def serve_image(asin):
+    return send_from_directory('static/images', f"{asin}.jpg")
+
+
+
+
+@app.route("/api/fetch-return-report", methods=["GET"])
+def fetch_return_report():
+    from amazon_api import get_report_document_id, get_presigned_settlement_url
+    import xml.etree.ElementTree as ET
+    from collections import defaultdict
+    from models import AmazonReturnStats
+
+    selling_partner_id = request.args.get("selling_partner_id")
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return jsonify({"error": "No access token found"}), 401
+
+    marketplace_id = get_marketplace_id_for_seller(selling_partner_id)
+    if not marketplace_id:
+        return jsonify({"error": "No marketplace ID found"}), 400
+
+    # Step 1: Request the report
+    report_id = request_returns_report(access_token, marketplace_id)
+    if not report_id:
+        return jsonify({"error": "Failed to request report"}), 500
+
+    # Step 2: Wait for report to finish and get document ID
+    document_id = get_report_document_id(report_id, access_token)
+    if not document_id:
+        return jsonify({"error": "❌ Report processing failed (FATAL or CANCELLED)"}), 500
+
+
+    # Step 3: Get the download URL
+    url = get_presigned_settlement_url(access_token, document_id)
+    if not url:
+        return jsonify({"error": "Failed to get presigned URL"}), 500
+
+    xml_data = requests.get(url).content.decode("utf-8")
+
+    # Step 4: Parse XML and summarize
+    root = ET.fromstring(xml_data)
+    monthly_data = defaultdict(lambda: {"total_returns": 0, "order_ids": set()})
+
+    for return_event in root.findall(".//ReturnItemDetails"):
+        order_id = return_event.findtext("OrderId")
+        return_date = return_event.findtext("ReturnDate")
+        if order_id and return_date:
+            month = return_date[:7]
+            monthly_data[month]["total_returns"] += 1
+            monthly_data[month]["order_ids"].add(order_id)
+
+    # Step 5: Save to DB
+    for month, data in monthly_data.items():
+        total_orders = len(data["order_ids"])
+        total_returns = data["total_returns"]
+        return_rate = total_returns / total_orders if total_orders else 0
+
+        existing = AmazonReturnStats.query.filter_by(
+            selling_partner_id=selling_partner_id,
+            month=month
+        ).first()
+
+        if existing:
+            existing.total_orders = total_orders
+            existing.total_returns = total_returns
+            existing.return_rate = return_rate
+            existing.last_updated = datetime.utcnow()
+        else:
+            db.session.add(AmazonReturnStats(
+                selling_partner_id=selling_partner_id,
+                marketplace=marketplace_id,
+                month=month,
+                total_orders=total_orders,
+                total_returns=total_returns,
+                return_rate=return_rate
+            ))
+
+    db.session.commit()
+    return jsonify({"message": f"✅ Saved return stats for {len(monthly_data)} month(s)"}), 200
+
+
+
+
+@app.route("/api/view-fba-financial-events", methods=["GET"])
+def view_fba_financial_events():
+    from amazon_api import list_financial_event_groups, get_financial_events_by_group
+
+    selling_partner_id = request.args.get("selling_partner_id")
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    access_token = get_stored_tokens(selling_partner_id)
+    if not access_token:
+        return jsonify({"error": "Access token not found"}), 401
+
+    start_date = (datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_date = (datetime.utcnow() - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    group_data = list_financial_event_groups(access_token, start_date, end_date)
+    group_list = group_data.get("payload", {}).get("FinancialEventGroupList", [])
+
+    all_events = []
+
+    for group in group_list:
+        group_id = group.get("FinancialEventGroupId")
+        if group_id:
+            print(f"📦 Fetching events for group: {group_id}")
+            group_events = get_financial_events_by_group(access_token, group_id)
+            if group_events and "payload" in group_events:
+                all_events.append({
+                    "group_id": group_id,
+                    "events": group_events["payload"]
+                })
+
+    return jsonify({
+        "selling_partner_id": selling_partner_id,
+        "group_count": len(group_list),
+        "fetched_event_groups": len(all_events),
+        "data": all_events
+    })
+
+
+
+@app.route("/api/return-rate-summary", methods=["GET"])
+def return_rate_summary():
+    from models import AmazonOrderItem, AmazonFinancialShipmentEvent
+    from sqlalchemy import func
+    from collections import defaultdict
+    from datetime import datetime, timedelta
+
+    selling_partner_id = request.args.get("selling_partner_id")
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    today = datetime.utcnow()
+    twelve_months_ago = today - timedelta(days=365)
+
+    order_items = AmazonOrderItem.query.filter(
+        AmazonOrderItem.selling_partner_id == selling_partner_id,
+        AmazonOrderItem.purchase_date != None,
+        AmazonOrderItem.purchase_date >= twelve_months_ago
+    ).all()
+
+    refund_events = AmazonFinancialShipmentEvent.query.filter(
+        AmazonFinancialShipmentEvent.selling_partner_id == selling_partner_id,
+        AmazonFinancialShipmentEvent.refund_fee != None
+    ).all()
+
+    refunded_order_ids = set(e.order_id for e in refund_events if e.order_id)
+
+    month_data = defaultdict(lambda: {"orders": 0, "returns": 0})
+
+    for item in order_items:
+        month = item.purchase_date.strftime("%Y-%m")
+        month_data[month]["orders"] += 1
+        if item.amazon_order_id in refunded_order_ids:
+            month_data[month]["returns"] += 1
+
+    total_returns = sum(d["returns"] for d in month_data.values())
+    total_orders = sum(d["orders"] for d in month_data.values())
+    overall_rate = round((total_returns / total_orders) * 100, 1) if total_orders else 0
+
+    return jsonify({
+        "total_returns": total_returns,
+        "return_rate_overall": overall_rate,
+        "monthly_return_counts": {
+            month: d["returns"]
+            for month, d in sorted(month_data.items())
+        },
+        "monthly_return_rates": {
+            month: round((d["returns"] / d["orders"]) * 100, 1) if d["orders"] else 0
+            for month, d in sorted(month_data.items())
+        }
+    })
+
+
+
+
+@app.route("/api/inventory-planner", methods=["GET"])
+def get_inventory_planner_data():
+    selling_partner_id = request.args.get("selling_partner_id")
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    # Get all inventory items
+    inventory_items = AmazonInventoryItem.query.filter_by(selling_partner_id=selling_partner_id).all()
+
+    # Get ASIN-level sales from last 30 days
+    one_month_ago = datetime.utcnow() - timedelta(days=30)
+    sales_data = db.session.query(
+        AmazonOrderItem.asin,
+        db.func.sum(AmazonOrderItem.quantity_shipped).label("total_units")
+    ).filter(
+        AmazonOrderItem.selling_partner_id == selling_partner_id,
+        AmazonOrderItem.purchase_date >= one_month_ago
+    ).group_by(AmazonOrderItem.asin).all()
+
+    sales_map = {asin: total_units / 30 for asin, total_units in sales_data if asin}
+
+    results = []
+    for item in inventory_items:
+        if not item.asin:
+            continue
+        results.append({
+            "asin": item.asin,
+            "title": item.product_name or "Untitled",
+            "quantity_available": item.quantity_available or 0,
+            "avg_30d_sales": round(sales_map.get(item.asin, 0), 2),
+            "delivery_eta_days": 30  # static or calculated later
+        })
+
+    return jsonify(results)

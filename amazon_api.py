@@ -304,13 +304,14 @@ def preview_settlement_report_from_url(presigned_url):
             row += [None] * (len(header) - len(row))
         padded_rows.append(row)
 
-    df = pd.DataFrame(padded_rows, columns=header)
+    # Clean up header safely
+    cleaned_header = [str(col).strip().lower().replace(" ", "-") if col else "unknown" for col in header]
 
-    # Clean up column names
-    df.columns = [col.strip().lower().replace(" ", "-") for col in df.columns]
+    df = pd.DataFrame(padded_rows, columns=cleaned_header)
 
     # Optional: only return top rows
     return df.head(50).to_dict(orient="records")
+
 
 
 
@@ -766,26 +767,6 @@ def save_shipment_events_by_group(access_token, selling_partner_id, group_id):
 
 
 
-def request_unsuppressed_inventory_report(access_token, selling_partner_id):
-    url = "https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports"
-    headers = {
-        "x-amz-access-token": access_token,
-        "Content-Type": "application/json"
-    }
-
-    marketplace_id = get_marketplace_id_for_seller(selling_partner_id)
-
-    body = {
-        "reportType": "GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA",
-        "marketplaceIds": [marketplace_id]
-    }
-
-    response = requests.post(url, headers=headers, json=body)
-    if response.status_code == 202:
-        return response.json().get("reportId")
-    else:
-        print(f"❌ Error requesting inventory report: {response.status_code} - {response.text}")
-        return None
 
 
 
@@ -795,19 +776,31 @@ def save_unsuppressed_inventory_to_db(file_path, selling_partner_id):
     import csv
     from sqlalchemy.exc import SQLAlchemyError
 
+    def parse_int(val):
+        try:
+            return int(val.strip())
+        except:
+            return 0
+
     try:
         rows = None
 
-        # First try UTF-8
+        # Try reading with UTF-8 first, fallback to latin-1
         try:
             with open(file_path, mode='r', newline='', encoding='utf-8-sig') as csvfile:
                 reader = csv.DictReader(csvfile)
-                rows = [dict((k.lower(), v) for k, v in row.items()) for row in reader]
+                rows = [
+                    {str(k).strip().lower(): v for k, v in row.items() if k}
+                    for row in reader
+                ]
         except UnicodeDecodeError:
             print("⚠️ utf-8 decoding failed, trying latin-1...")
             with open(file_path, mode='r', newline='', encoding='latin-1') as csvfile:
                 reader = csv.DictReader(csvfile)
-                rows = [dict((k.lower(), v) for k, v in row.items()) for row in reader]
+                rows = [
+                    {str(k).strip().lower(): v for k, v in row.items() if k}
+                    for row in reader
+                ]
 
         if not rows:
             print("❌ No rows read from the CSV file.")
@@ -819,12 +812,11 @@ def save_unsuppressed_inventory_to_db(file_path, selling_partner_id):
                 print("⚠️ Skipping row with missing SKU:", row)
                 continue
 
-            item = AmazonInventoryItem.query.filter_by(selling_partner_id=selling_partner_id, sku=sku).first()
+            item = AmazonInventoryItem.query.filter_by(
+                selling_partner_id=selling_partner_id, sku=sku
+            ).first()
             if not item:
-                item = AmazonInventoryItem(
-                    selling_partner_id=selling_partner_id,
-                    sku=sku
-                )
+                item = AmazonInventoryItem(selling_partner_id=selling_partner_id, sku=sku)
                 db.session.add(item)
 
             item.asin = row.get("asin")
@@ -835,10 +827,9 @@ def save_unsuppressed_inventory_to_db(file_path, selling_partner_id):
             item.detailed_disposition = row.get("detailed-disposition")
             item.inventory_country = row.get("country")
             item.inventory_status = row.get("status")
-            try:
-                item.quantity_available = int((row.get("quantity-available") or "0").strip())
-            except ValueError:
-                item.quantity_available = 0
+
+            # ✅ Use correct field: afn-total-quantity
+            item.quantity_available = parse_int(row.get("afn-total-quantity") or "0")
 
         db.session.commit()
         print("✅ Unsuppressed inventory saved to AmazonInventoryItem table.")
@@ -851,6 +842,8 @@ def save_unsuppressed_inventory_to_db(file_path, selling_partner_id):
     except Exception as e:
         db.session.rollback()
         print(f"❌ Unexpected error: {e}")
+
+
 
 
 
@@ -872,38 +865,62 @@ def fetch_order_address(access_token, order_id):
 
 
 
+def fetch_and_save_report_file(report_document_id, access_token):
+    headers = {
+        "x-amz-access-token": access_token
+    }
+    url = f"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/documents/{report_document_id}"
+    res = requests.get(url, headers=headers)
+
+    if res.status_code != 200:
+        print(f"❌ Failed to fetch inventory report document: {res.status_code} - {res.text}")
+        return None
+
+    doc = res.json()
+    download_url = doc.get("url")
+
+    file_name = f"{int(time.time())}.csv"
+    with open(file_name, "wb") as f:
+        f.write(requests.get(download_url).content)
+
+    print(f"✅ Inventory report saved to {file_name}")
+    return file_name
+
+
 
 def download_inventory_report_file(report_id, access_token):
-    try:
-        url = f"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/documents/{report_id}"
-        headers = {
-            "x-amz-access-token": access_token
-        }
-        response = requests.get(url, headers=headers)
+    headers = {
+        "x-amz-access-token": access_token,
+        "Content-Type": "application/json"
+    }
+
+    status_url = f"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports/{report_id}"
+
+    # ⏳ Poll until report is ready
+    for _ in range(20):  # try for ~75 seconds
+        response = requests.get(status_url, headers=headers)
         if response.status_code != 200:
-            print(f"❌ Failed to fetch inventory report document: {response.status_code} - {response.text}")
+            print(f"❌ Failed to check report status: {response.status_code} - {response.text}")
             return None
 
-        download_url = response.json().get("url")
-        if not download_url:
-            print("❌ Download URL not found in response.")
+        data = response.json()
+        status = data.get("processingStatus")
+
+        if status == "DONE":
+            report_document_id = data.get("reportDocumentId")
+            break
+        elif status in ["CANCELLED", "FATAL"]:
+            print(f"❌ Report failed with status: {status}")
             return None
 
-        download_response = requests.get(download_url)
-        if download_response.status_code != 200:
-            print(f"❌ Failed to download inventory file: {download_response.status_code} - {download_response.text}")
-            return None
-
-        file_name = f"{int(time.time())}.csv"
-        with open(file_name, "wb") as f:
-            f.write(download_response.content)
-
-        print(f"✅ Inventory report saved to {file_name}")
-        return file_name
-
-    except Exception as e:
-        print(f"❌ Unexpected error downloading inventory report: {e}")
+        print(f"⏳ Report still {status}, waiting 5 seconds...")
+        time.sleep(5)
+    else:
+        print("❌ Report was not ready in time.")
         return None
+
+    # ✅ Now fetch and save the report file using reportDocumentId
+    return fetch_and_save_report_file(report_document_id, access_token)
 
 
 
@@ -1058,33 +1075,377 @@ def save_inventory_items(data_list, selling_partner_id):
         print(f"❌ Error saving inventory items: {e}")
 
 
+from models import AmazonOAuthTokens
 
-def sync_unsuppressed_inventory_report(selling_partner_id):
-    from app import get_stored_tokens
-    access_token = get_stored_tokens(selling_partner_id)
-    if not access_token:
-        print(f"❌ No access token found for {selling_partner_id}")
-        return None
+def get_access_token(selling_partner_id):
+    token = AmazonOAuthTokens.query.filter_by(selling_partner_id=selling_partner_id).first()
+    if not token:
+        raise Exception("No token found for this selling_partner_id")
+
+    # If token is expired, refresh
+    if token.expires_at <= datetime.utcnow():
+        refresh_response = requests.post(
+            "https://api.amazon.com/auth/o2/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": token.refresh_token,
+                "client_id": token.client_id,
+                "client_secret": token.client_secret,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+        if refresh_response.status_code != 200:
+            raise Exception(f"Failed to refresh token: {refresh_response.text}")
+
+        new_token = refresh_response.json()
+        token.access_token = new_token["access_token"]
+        token.expires_at = datetime.utcnow() + timedelta(seconds=new_token["expires_in"])
+        token.token_type = new_token.get("token_type", "Bearer")
+        token.scope = new_token.get("scope", "")
+        token.updated_at = datetime.utcnow()
+        token.save()
+
+    return token.access_token
+
+
+
+
+
+
+
+import io
+
+
+def save_unsuppressed_inventory_report(access_token, selling_partner_id):
+    try:
+        print(f"📥 Starting inventory report for {selling_partner_id}")
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "x-amz-access-token": access_token
+        }
+
+        body = {
+            "reportType": "GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA",
+            "marketplaceIds": ["A1AM78C64UM0Y8"]  # Mexico
+        }
+
+        # Step 1: Request the report
+        res = requests.post("https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports", headers=headers, json=body)
+        if res.status_code != 202:
+            raise Exception(f"❌ Failed to request report: {res.text}")
+        
+        report_id = res.json()["reportId"]
+        print(f"📝 Report requested: {report_id}")
+
+        # Step 2: Wait for report completion
+        for _ in range(20):
+            status = requests.get(f"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports/{report_id}", headers=headers).json()
+            if status["processingStatus"] == "DONE":
+                document_id = status["reportDocumentId"]
+                break
+            elif status["processingStatus"] in ["CANCELLED", "FATAL"]:
+                raise Exception(f"❌ Report failed: {status['processingStatus']}")
+            time.sleep(10)
+        else:
+            raise Exception("❌ Report not ready after 200 seconds.")
+
+        # Step 3: Get download URL
+        doc_res = requests.get(f"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/documents/{document_id}", headers=headers)
+        download_url = doc_res.json()["url"]
+        print("📎 Got download URL.")
+
+        # Step 4: Download and decode file
+        file = requests.get(download_url)
+        try:
+            content = file.content.decode("utf-8")
+        except UnicodeDecodeError:
+            print("⚠️ UTF-8 decode failed. Retrying with latin-1...")
+            content = file.content.decode("latin-1")
+
+        reader = csv.DictReader(io.StringIO(content), delimiter="\t")
+        print("🧪 CSV headers:", reader.fieldnames)
+
+        # Step 5: Clear existing entries
+        AmazonInventoryItem.query.filter_by(selling_partner_id=selling_partner_id).delete()
+
+        # Step 6: Save items to database
+        items_saved = 0
+        for row in reader:
+            try:
+                quantity = row.get("afn-fulfillable-quantity", "0").strip()
+                quantity_available = int(quantity) if quantity.isdigit() else 0
+
+                item = AmazonInventoryItem(
+                    selling_partner_id=selling_partner_id,
+                    asin=row.get("asin"),
+                    fnsku=row.get("fnsku"),
+                    sku=row.get("sku"),
+                    product_name=row.get("product-name"),
+                    condition=row.get("condition"),
+                    price=row.get("your-price"),
+                    quantity_available=quantity_available,
+                    last_updated=datetime.utcnow(),
+                    image_url = fetch_main_image_from_catalog(asin, access_token)
+
+                )
+                db.session.add(item)
+                items_saved += 1
+            except Exception as e:
+                print(f"⚠️ Error saving item {row.get('asin')}: {e}")
+
+        db.session.commit()
+        print(f"✅ Saved {items_saved} inventory items for {selling_partner_id}")
+
+    except Exception as e:
+        print(f"❌ Error saving inventory report: {e}")
+        raise
+
+
+
+
+
+
+
+def generate_merchant_listings_report(access_token, selling_partner_id):
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "x-amz-access-token": access_token
+    }
+
+    body = {
+        "reportType": "GET_CSV_MFN_PRIME_RETURNS_REPORT",
+        "marketplaceIds": ["A1AM78C64UM0Y8"],  # Amazon Mexico
+        "reportOptions": {
+            "custom": "true"  # ✅ Important: returns all available fields
+        }
+    }
 
     # Step 1: Request the report
-    report_id = request_unsuppressed_inventory_report(access_token, selling_partner_id)
-    if not report_id:
-        print("❌ Could not request inventory report.")
-        return None
+    res = requests.post(
+        "https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports",
+        headers=headers,
+        json=body
+    )
+    if res.status_code != 202:
+        raise Exception(f"❌ Failed to request report: {res.text}")
 
-    # Step 2: Wait for report document ID
+    report_id = res.json()["reportId"]
+
+    # Step 2: Wait until it's ready
+    for _ in range(20):
+        status_res = requests.get(
+            f"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports/{report_id}",
+            headers=headers
+        )
+        status = status_res.json()["processingStatus"]
+        print(f"⏳ Status: {status}")
+        if status == "DONE":
+            return status_res.json()["reportDocumentId"]
+        if status in ("CANCELLED", "FATAL"):
+            raise Exception(f"❌ Report failed: {status}")
+        time.sleep(10)
+
+    raise Exception("❌ Report not ready after waiting 200 seconds.")
+
+
+
+
+def fetch_main_image_from_catalog(asin, access_token):
+    try:
+        url = f"https://sellingpartnerapi-na.amazon.com/catalog/2022-04-01/items/{asin}?marketplaceIds=A1AM78C64UM0Y8"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "x-amz-access-token": access_token,
+            "Content-Type": "application/json"
+        }
+        res = requests.get(url, headers=headers)
+        if res.status_code == 200:
+            data = res.json()
+            images = data.get("images", [])
+            if images:
+                return images[0].get("link")
+        else:
+            print(f"⚠️ Catalog API error for ASIN {asin}: {res.status_code}")
+    except Exception as e:
+        print(f"⚠️ Error fetching catalog image for {asin}: {e}")
+    return None
+
+
+
+
+def save_merged_inventory_report(access_token, selling_partner_id):
+    try:
+        print(f"📥 Merging inventory reports for {selling_partner_id}...")
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "x-amz-access-token": access_token,
+            "Content-Type": "application/json"
+        }
+
+        def get_report(report_type):
+            print(f"📄 Requesting report: {report_type}")
+            res = requests.post(
+                "https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports",
+                headers=headers,
+                json={"reportType": report_type, "marketplaceIds": ["A1AM78C64UM0Y8"]}
+            )
+            if res.status_code != 202:
+                raise Exception(f"❌ Failed to request {report_type}: {res.text}")
+            report_id = res.json()["reportId"]
+
+            for _ in range(20):
+                status_res = requests.get(
+                    f"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports/{report_id}",
+                    headers=headers
+                )
+                status_data = status_res.json()
+                if status_data["processingStatus"] == "DONE":
+                    document_id = status_data["reportDocumentId"]
+                    break
+                elif status_data["processingStatus"] in ["CANCELLED", "FATAL"]:
+                    raise Exception(f"❌ {report_type} failed: {status_data['processingStatus']}")
+                time.sleep(10)
+            else:
+                raise Exception(f"❌ {report_type} not ready after waiting.")
+            
+            doc = requests.get(f"https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/documents/{document_id}", headers=headers)
+            url = doc.json()["url"]
+            file = requests.get(url)
+            try:
+                content = file.content.decode("utf-8")
+            except UnicodeDecodeError:
+                content = file.content.decode("latin-1")
+            return list(csv.DictReader(io.StringIO(content), delimiter="\t"))
+
+        listings = get_report("GET_MERCHANT_LISTINGS_ALL_DATA")
+        inventory = get_report("GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA")
+
+        inventory_map = {r["asin"]: r for r in inventory if r.get("asin")}
+        AmazonInventoryItem.query.filter_by(selling_partner_id=selling_partner_id).delete()
+
+        items_saved = 0
+        for row in listings:
+            asin = row.get("asin1")
+            if not asin or asin not in inventory_map:
+                continue
+            inv = inventory_map[asin]
+
+            try:
+                quantity = inv.get("afn-fulfillable-quantity", "0").strip()
+                quantity_available = int(quantity) if quantity.isdigit() else 0
+
+                # 🔍 Use catalog API to fetch image
+                image_url = fetch_main_image_from_catalog(asin, access_token)
+
+                item = AmazonInventoryItem(
+                    selling_partner_id=selling_partner_id,
+                    asin=asin,
+                    sku=row.get("seller-sku"),
+                    product_name=row.get("item-name"),
+                    condition=inv.get("condition"),
+                    price=row.get("price"),
+                    quantity_available=quantity_available,
+                    image_url=image_url,
+                    last_updated=datetime.utcnow()
+                )
+                db.session.add(item)
+                items_saved += 1
+            except Exception as e:
+                print(f"⚠️ Error saving {asin}: {e}")
+
+        db.session.commit()
+        print(f"✅ Saved {items_saved} items for {selling_partner_id}")
+
+    except Exception as e:
+        print(f"❌ Error in save_merged_inventory_report: {e}")
+        raise
+
+
+def request_returns_report(access_token, marketplace_id):
+    url = "https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports"
+    headers = {"x-amz-access-token": access_token}
+    payload = {
+        "reportType": "GET_XML_RETURNS_DATA_BY_RETURN_DATE",
+        "marketplaceIds": [marketplace_id],
+        "reportOptions": {}
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+    if response.status_code == 202:
+        return response.json()["reportId"]
+    print("❌ Error requesting returns report:", response.text)
+    return None
+
+
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+
+def parse_returns_xml(xml_content):
+    root = ET.fromstring(xml_content)
+    monthly_data = defaultdict(lambda: {"total_returns": 0, "order_ids": set()})
+
+    for return_event in root.findall(".//ReturnItemDetails"):
+        order_id = return_event.findtext("OrderId")
+        return_date = return_event.findtext("ReturnDate")
+
+        if order_id and return_date:
+            month_key = return_date[:7]  # Format YYYY-MM
+            monthly_data[month_key]["total_returns"] += 1
+            monthly_data[month_key]["order_ids"].add(order_id)
+
+    return monthly_data
+
+
+def save_return_stats(monthly_data, selling_partner_id, marketplace):
+    from models import AmazonReturnStats  # Ensure this import is available
+
+    for month, data in monthly_data.items():
+        total_orders = len(data["order_ids"])
+        total_returns = data["total_returns"]
+        return_rate = total_returns / total_orders if total_orders else 0
+
+        existing = AmazonReturnStats.query.filter_by(
+            selling_partner_id=selling_partner_id,
+            month=month
+        ).first()
+
+        if existing:
+            existing.total_orders = total_orders
+            existing.total_returns = total_returns
+            existing.return_rate = return_rate
+        else:
+            db.session.add(AmazonReturnStats(
+                selling_partner_id=selling_partner_id,
+                marketplace=marketplace,
+                month=month,
+                total_orders=total_orders,
+                total_returns=total_returns,
+                return_rate=return_rate
+            ))
+
+    db.session.commit()
+    print("✅ Saved monthly return stats")
+
+
+def fetch_and_save_returns_report(selling_partner_id, access_token):
+    marketplace_id = get_marketplace_id_for_seller(selling_partner_id)
+    report_id = request_returns_report(access_token, marketplace_id)
+    if not report_id:
+        return
+
     document_id = get_report_document_id(report_id, access_token)
     if not document_id:
-        print("❌ Could not get document ID for report.")
-        return None
+        return
 
-    # Step 3: Download the file
-    file_path = download_inventory_report_file(document_id, access_token)
-    if not file_path:
-        print("❌ Could not download inventory report file.")
-        return None
+    url = get_presigned_settlement_url(access_token, document_id)
+    if not url:
+        return
 
-    # Step 4: Parse and save to DB
-    save_unsuppressed_inventory_to_db(file_path, selling_partner_id)
-    return file_path
-
+    xml_data = requests.get(url).content.decode("utf-8")
+    monthly_data = parse_returns_xml(xml_data)
+    save_return_stats(monthly_data, selling_partner_id, marketplace_id)

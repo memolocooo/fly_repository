@@ -129,6 +129,10 @@ class AmazonOrderItem(db.Model):
     cogs = db.Column(db.Numeric(10, 2), nullable=True, default=0)
     purchase_date = db.Column(db.DateTime, nullable=True)
     image_url = db.Column(db.Text)
+    marketplace = db.Column(db.String(50), nullable=True)
+    safety_stock = db.Column(db.Integer, nullable=True)
+
+
 
     def to_dict(self):
         return {
@@ -150,7 +154,9 @@ class AmazonOrderItem(db.Model):
             "created_at": self.created_at.strftime('%Y-%m-%d %H:%M:%S'),
             "cogs": self.cogs,
             "purchase_date" : self.purchase_date.strftime('%Y-%m-%d %H:%M:%S') if self.purchase_date else None,
-            "image_url": self.image_url
+            "image_url": self.image_url,
+            "marketplace": self.marketplace,
+            "safety_stock": self.safety_stock
         }
 
 
@@ -217,6 +223,11 @@ class AmazonInventoryItem(db.Model):
     inventory_status = db.Column(db.String, nullable=True)
     quantity_available = db.Column(db.Integer, nullable=True)
     last_updated = db.Column(db.DateTime, default=datetime.utcnow)
+    price = db.Column(db.String, nullable=True)  # for "price"
+    inventory_status = db.Column(db.String, nullable=True)  # for "status"
+    image_url = db.Column(db.String, nullable=True)  # for "image_url"
+    
+
 
     def to_dict(self):
         return {
@@ -231,6 +242,9 @@ class AmazonInventoryItem(db.Model):
             "inventory_status": self.inventory_status,
             "quantity_available": self.quantity_available,
             "last_updated": self.last_updated.strftime('%Y-%m-%d %H:%M:%S'),
+            "price": float(self.price) if self.price else None,
+            "inventory_status": self.inventory_status,  # for "status"
+            "image_url": f"https://ws-na.amazon-adsystem.com/widgets/q?_encoding=UTF8&ASIN={self.asin}&Format=_SL75_&ID=AsinImage" if self.asin else None
         }
 
 
@@ -268,3 +282,22 @@ class Client(db.Model):
 
     def __repr__(self):
         return f"<Client {self.selling_partner_id}>"
+    
+
+
+
+
+class AmazonReturnStats(db.Model):
+    __tablename__ = 'amazon_return_stats'
+
+    id = db.Column(db.Integer, primary_key=True)
+    selling_partner_id = db.Column(db.String, nullable=False)
+    marketplace = db.Column(db.String, nullable=True)
+    month = db.Column(db.String, nullable=False)  # Format: YYYY-MM
+    total_orders = db.Column(db.Integer, nullable=False)
+    total_returns = db.Column(db.Integer, nullable=False)
+    return_rate = db.Column(db.Float, nullable=False)
+    last_updated = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+
