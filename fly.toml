@@ -20,7 +20,15 @@ primary_region = 'gdl'
   min_machines_running = 0
   processes = ['app']
 
-[[vm]]
+[vm]
   memory = '1gb'
   cpu_kind = 'shared'
   cpus = 1
+
+[[services]]
+  internal_port = 5432
+  protocol = "tcp"
+
+  [[services.ports]]
+    handlers = ["pg_tls"]
+    port = 5432

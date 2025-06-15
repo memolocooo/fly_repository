@@ -19,6 +19,7 @@ from models import db, AmazonOAuthTokens, AmazonOrders, AmazonSettlementData,Ama
 import psycopg2
 from psycopg2.extras import execute_values
 from amazon_api import fetch_orders_from_amazon,  fetch_order_items, sync_settlement_report, fetch_and_preview_latest_settlement_report, get_presigned_settlement_url, save_settlement_report_to_v2_table, request_all_listings_report, download_listings_report, list_financial_event_groups, fetch_order_address, download_inventory_report_file, save_unsuppressed_inventory_to_db, get_report_document_id, save_unsuppressed_inventory_report, generate_merchant_listings_report,request_returns_report, get_marketplace_id_for_seller  #Adjust module name if needed
+from dateutil.relativedelta import relativedelta
 
 # Load environment variables
 load_dotenv()
@@ -237,25 +238,39 @@ def store_orders_in_db(selling_partner_id, orders):
 
  
 
-@app.route('/start-oauth')
+
+import base64
+
+@app.route("/start-oauth")
 def start_oauth():
-    """Redirects user to Amazon for OAuth authentication."""
-    state = str(uuid.uuid4())
-    session["oauth_state"] = state
+    # ✅ ID real de tu app registrada en Amazon Seller Central
+    application_id = "amzn1.sp.solution.7c0c9136-f04c-46e2-b4f0-0c18a7996a24"
+    redirect_uri = "https://render-webflow-restless-river-7629.fly.dev/callback"
 
-    oauth_url = (
-    f"{AUTH_URL}/apps/authorize/consent"
-    f"?application_id={APP_ID}"
-    f"&state={state}"
-    f"&redirect_uri={REDIRECT_URI}"
-    f"&scope=sellingpartnerapi::notifications"
-    f"&version=beta"
-)
+    marketplace_id = request.args.get("marketplace_id")
+    if not marketplace_id:
+        return "Missing marketplace_id", 400
+
+    # Codifica el estado como JSON en base64 para incluir el marketplace_id
+    state_data = {
+        "uuid": str(uuid.uuid4()),
+        "marketplace_id": marketplace_id
+    }
+    encoded_state = base64.urlsafe_b64encode(json.dumps(state_data).encode()).decode()
+
+    # Redirige al usuario al consentimiento de Amazon
+    redirect_url = (
+        f"https://sellercentral.amazon.com/apps/authorize/consent?"
+        f"application_id={application_id}&"
+        f"state={encoded_state}&"
+        f"redirect_uri={redirect_uri}&"
+        f"scope=sellingpartnerapi::notifications&version=beta"
+    )
+
+    return redirect(redirect_url)
 
 
 
-    print(f"🔗 OAuth Redirect URL: {oauth_url}")
-    return redirect(oauth_url)
 
 
 @app.route("/callback")
@@ -263,14 +278,30 @@ def callback():
     from models import db, Client, MarketplaceParticipation
     from amazon_api import fetch_marketplaces_for_seller
     import requests
+    import base64
+    import json
 
     try:
         auth_code = request.args.get("spapi_oauth_code")
         selling_partner_id = request.args.get("selling_partner_id")
-        state = request.args.get("state")  # Optional for CSRF protection
+        state_encoded = request.args.get("state")
 
         print(f"🚀 Received auth_code: {auth_code}")
         print(f"🔍 Received selling_partner_id: {selling_partner_id}")
+
+        # Decode the state to retrieve marketplace_id
+        if state_encoded:
+            try:
+                decoded_state = base64.urlsafe_b64decode(state_encoded).decode()
+                state_data = json.loads(decoded_state)
+                marketplace_id = state_data.get("marketplace_id")
+                print(f"🌍 Received marketplace_id: {marketplace_id}")
+            except Exception as decode_err:
+                print(f"❌ Failed to decode state: {decode_err}")
+                marketplace_id = None
+        else:
+            print("⚠️ No state parameter provided")
+            marketplace_id = None
 
         if not auth_code or not selling_partner_id:
             return jsonify({"error": "Missing required parameters."}), 400
@@ -280,7 +311,7 @@ def callback():
         if not token_data:
             return jsonify({"error": "Failed to exchange authorization code."}), 500
 
-        # Step 2: Save tokens to AmazonOAuthTokens
+        # Step 2: Save tokens
         save_oauth_tokens(
             selling_partner_id,
             token_data["access_token"],
@@ -289,14 +320,14 @@ def callback():
         )
         print(f"✅ Tokens saved successfully for {selling_partner_id}")
 
-        # Step 3: Create or find Client
+        # Step 3: Create or update Client
         client = Client.query.filter_by(selling_partner_id=selling_partner_id).first()
         if not client:
             client = Client(
                 selling_partner_id=selling_partner_id,
                 access_token=token_data["access_token"],
                 refresh_token=token_data["refresh_token"],
-                region="na"  # Adjust if needed
+                region="na"
             )
             db.session.add(client)
             db.session.commit()
@@ -307,51 +338,52 @@ def callback():
         # Step 4: Fetch and Save Marketplaces
         try:
             marketplaces = fetch_marketplaces_for_seller(token_data["access_token"])
-
             if marketplaces:
                 for marketplace in marketplaces:
-                    existing = MarketplaceParticipation.query.filter_by(
+                    exists = MarketplaceParticipation.query.filter_by(
                         client_id=client.id,
                         selling_partner_id=selling_partner_id,
                         marketplace_id=marketplace["marketplace_id"]
                     ).first()
 
-                    if not existing:
-                        new_marketplace = MarketplaceParticipation(
+                    if not exists:
+                        db.session.add(MarketplaceParticipation(
                             client_id=client.id,
                             selling_partner_id=selling_partner_id,
                             marketplace_id=marketplace["marketplace_id"],
                             country_code=marketplace["country_code"],
                             is_participating=True
-                        )
-                        db.session.add(new_marketplace)
-
+                        ))
                 db.session.commit()
                 print(f"✅ Saved {len(marketplaces)} marketplaces for {selling_partner_id}")
-
             else:
-                print(f"⚠️ No marketplaces returned for {selling_partner_id}")
-
+                print("⚠️ No marketplaces returned")
         except Exception as e:
-            print(f"❌ Error fetching marketplaces: {str(e)}")
+            print(f"❌ Error fetching marketplaces: {e}")
 
-        # Step 5: Optionally trigger /api/start-data-fetch
+        # Step 5: Trigger data fetch (includes selling_partner_id and marketplace_id)
         try:
+            payload = {
+                "selling_partner_id": selling_partner_id,
+                "marketplace_id": marketplace_id
+            }
             requests.post(
                 "https://render-webflow-restless-river-7629.fly.dev/api/start-data-fetch",
-                json={"selling_partner_id": selling_partner_id},
+                json=payload,
                 timeout=5
             )
-            print("✅ Data fetching triggered successfully!")
+            print("✅ Data fetching triggered")
         except Exception as e:
-            print(f"⚠️ Failed to trigger start-data-fetch: {e}")
+            print(f"⚠️ Failed to trigger data fetch: {e}")
 
-        # 🚀 Step 6: Redirect to dashboard WITH selling_partner_id
-        return redirect(f"https://guillermos-amazing-site-b0c75a.webflow.io/dashboard?selling_partner_id={selling_partner_id}")
+        # Step 6: Redirect to dashboard with both identifiers
+        return redirect(f"https://guillermos-amazing-site-b0c75a.webflow.io/dashboard?selling_partner_id={selling_partner_id}&marketplace_id={marketplace_id}")
 
     except Exception as e:
-        print(f"❌ Error in callback: {str(e)}")
+        print(f"❌ Error in callback: {e}")
         return jsonify({"error": "Internal server error."}), 500
+
+
 
 
 
@@ -361,32 +393,31 @@ def start_data_fetch():
         fetch_orders_from_amazon,
         fetch_order_items,
         save_shipment_events_by_group,
-        list_financial_event_groups,
-        get_marketplace_id_for_seller
+        list_financial_event_groups
     )
     from models import db, AmazonOrders, AmazonOrderItem, AmazonFinancialShipmentEvent
-    from app import store_order_items_in_db  # ⬅️ Make sure this matches where it's defined
+    from app import store_order_items_in_db  # ensure path is correct
 
     data = request.get_json()
     selling_partner_id = data.get("selling_partner_id")
-    if not selling_partner_id:
-        return jsonify({"error": "Missing selling_partner_id"}), 400
+    marketplace_id = data.get("marketplace_id")
+
+    if not selling_partner_id or not marketplace_id:
+        return jsonify({"error": "Missing selling_partner_id or marketplace_id"}), 400
 
     access_token = get_stored_tokens(selling_partner_id)
     if not access_token:
         return jsonify({"error": "No access token found"}), 401
 
     try:
-        print(f"🚀 Starting full data fetch for {selling_partner_id}...")
-
-        marketplace_id = get_marketplace_id_for_seller(selling_partner_id)
-        if not marketplace_id:
-            return jsonify({"error": "No marketplace_id found"}), 400
+        print(f"🚀 Starting full data fetch for {selling_partner_id} - {marketplace_id}")
 
         one_year_ago = (datetime.utcnow() - timedelta(days=365)).isoformat()
 
         # 1️⃣ Fetch and store orders
-        orders = fetch_orders_from_amazon(selling_partner_id, access_token, one_year_ago)
+        orders = fetch_orders_from_amazon(
+            selling_partner_id, access_token, one_year_ago, marketplace_id
+        )
         if orders:
             for order in orders:
                 amazon_order_id = order["AmazonOrderId"]
@@ -412,11 +443,12 @@ def start_data_fetch():
         else:
             print("⚠️ No orders found.")
 
-        # 2️⃣ Fetch order items for those orders
+        # 2️⃣ Fetch order items for recent orders
         one_year_ago_dt = datetime.utcnow() - timedelta(days=365)
         recent_orders = AmazonOrders.query.filter(
             AmazonOrders.selling_partner_id == selling_partner_id,
-            AmazonOrders.purchase_date >= one_year_ago_dt
+            AmazonOrders.purchase_date >= one_year_ago_dt,
+            AmazonOrders.marketplace_id == marketplace_id
         ).all()
 
         item_count = 0
@@ -445,16 +477,17 @@ def start_data_fetch():
             for group in financial_groups.get("payload", {}).get("FinancialEventGroupList", []):
                 group_id = group.get("FinancialEventGroupId")
                 if group_id:
-                    save_shipment_events_by_group(access_token, selling_partner_id, group_id)
+                    save_shipment_events_by_group(
+                        access_token, selling_partner_id, group_id
+                    )
 
-        print(f"✅ Finished full data sync for {selling_partner_id}")
+        print(f"✅ Finished full data sync for {selling_partner_id} in {marketplace_id}")
         return jsonify({"message": "✅ Data fetching and saving completed."})
 
     except Exception as e:
         db.session.rollback()
         print(f"❌ Error during start-data-fetch: {e}")
         return jsonify({"error": "Failed to fetch data."}), 500
-
 
 
 
@@ -745,12 +778,23 @@ def get_all_order_items():
 @app.route("/api/order-items", methods=["GET"])
 def get_order_items_for_dashboard():
     selling_partner_id = request.args.get("selling_partner_id")
+    marketplace_id = request.args.get("marketplace_id")  # ← get the ID
     if not selling_partner_id:
         return jsonify({"error": "Missing selling_partner_id"}), 400
 
-    # Get all items for the seller
-    items = AmazonOrderItem.query.filter_by(selling_partner_id=selling_partner_id).all()
+    # Map from ID to readable name
+    MARKETPLACE_ID_TO_NAME = {
+        "A1AM78C64UM0Y8": "Amazon.com.mx",
+        "ATVPDKIKX0DER": "Amazon.com",
+        "APJ6JRA9NG5V4": "Amazon.ca",
+    }
+    marketplace_name = MARKETPLACE_ID_TO_NAME.get(marketplace_id)
 
+    query = AmazonOrderItem.query.filter_by(selling_partner_id=selling_partner_id)
+    if marketplace_name:
+        query = query.filter_by(marketplace=marketplace_name)
+
+    items = query.all()
     seen_asins = set()
     unique_items = []
 
@@ -758,27 +802,31 @@ def get_order_items_for_dashboard():
         cogs = float(item.cogs or 0)
         fees = float(item.item_tax or 0) + float(item.shipping_tax or 0)
         revenue = float(item.item_price or 0) + float(item.shipping_price or 0)
-        margin = revenue - (cogs + fees)
-        return round(margin, 2)
+        return round(revenue - (cogs + fees), 2)
 
     for item in items:
         if item.asin not in seen_asins:
             seen_asins.add(item.asin)
             unique_items.append({
-                "order_item_id": item.order_item_id,
-                "title": item.title,
-                "seller_sku": item.seller_sku,
-                "asin": item.asin,
-                "item_price": float(item.item_price or 0),
-                "shipping_price": float(item.shipping_price or 0),
-                "amazon_fees": float(item.item_tax or 0) + float(item.shipping_tax or 0),
-                "cogs": float(item.cogs or 0),
-                "margin": compute_margin(item),
-                "image_url": item.image_url or f"https://render-webflow-restless-river-7629.fly.dev/images/{item.asin}.jpg",
-                "marketplace": item.marketplace or "Unknown"  # ✅ added marketplace here
-            })
+    "order_item_id": item.order_item_id,
+    "title": item.title,
+    "seller_sku": item.seller_sku,
+    "asin": item.asin,
+    "item_price": float(item.item_price or 0),
+    "shipping_price": float(item.shipping_price or 0),
+    "amazon_fees": float(item.item_tax or 0) + float(item.shipping_tax or 0),
+    "cogs": float(item.cogs or 0),
+    "safety_stock": int(item.safety_stock or 0),
+    "time_delivery": int(item.time_delivery or 0),
+    "margin": compute_margin(item),
+    "image_url": item.image_url or f"https://render-webflow-restless-river-7629.fly.dev/images/{item.asin}.jpg",
+    "marketplace": item.marketplace or "Unknown"
+})
+
 
     return jsonify(unique_items)
+
+
 
 
 
@@ -786,13 +834,35 @@ def get_order_items_for_dashboard():
 @app.route("/api/dashboard-data", methods=["GET"])
 def get_dashboard_data():
     selling_partner_id = request.args.get("selling_partner_id")
-    start_date = request.args.get("start_date")
-    end_date = request.args.get("end_date")
+    marketplace_id     = (request.args.get("marketplace_id") or "").strip()
+    marketplace_name   = (request.args.get("marketplace") or "").strip()
+    start_date         = request.args.get("start_date")
+    end_date           = request.args.get("end_date")
 
     if not selling_partner_id:
         return jsonify({"error": "Missing selling_partner_id"}), 400
 
+    apply_marketplace_id_filter = marketplace_id and marketplace_id.lower() != "all"
+    apply_marketplace_name_filter = marketplace_name and marketplace_name.lower() != "all"
+
+    from sqlalchemy import func
+
+    MARKETPLACE_ID_TO_NAME = {
+        "A1AM78C64UM0Y8": "Amazon.com.mx",
+        "ATVPDKIKX0DER": "Amazon.com",
+        "APJ6JRA9NG5V4": "Amazon.ca",
+        # Add more as needed
+    }
+
+    # ── Orders query ───────────────────────────────────────────────────────────
     orders_query = AmazonOrders.query.filter_by(selling_partner_id=selling_partner_id)
+
+    if apply_marketplace_id_filter:
+        orders_query = orders_query.filter_by(marketplace_id=marketplace_id)
+    elif apply_marketplace_name_filter:
+        marketplace_id_from_name = next((k for k, v in MARKETPLACE_ID_TO_NAME.items() if v == marketplace_name), None)
+        if marketplace_id_from_name:
+            orders_query = orders_query.filter_by(marketplace_id=marketplace_id_from_name)
 
     if start_date:
         try:
@@ -810,30 +880,41 @@ def get_dashboard_data():
 
     orders = orders_query.all()
 
-    # 🚚 Shipping by order
+    if not orders:
+        return jsonify({
+            "cards": {
+                "total_sales": 0,
+                "revenue":     0,
+                "amazon_fees": 0,
+                "roi":         0
+            },
+            "orders": [],
+            "shipment_events": []
+        })
+
+    # ── Compute shipping, totals, ROI ─────────────────────────────────────────
     shipping_map = {}
     for order in orders:
-        shipping_price = sum(
+        shipping_total = sum(
             float(item.shipping_price or 0)
             for item in AmazonOrderItem.query.filter_by(amazon_order_id=order.amazon_order_id).all()
         )
-        shipping_map[order.amazon_order_id] = shipping_price
+        shipping_map[order.amazon_order_id] = shipping_total
 
-    # 💰 Card metrics
     order_total_sales = sum(float(order.total_amount or 0) for order in orders)
-    shipping_total = sum(shipping_map.values())
-    total_sales = order_total_sales + shipping_total
-    total_fees = sum(float(order.amazon_fees or 0) for order in orders)
-    total_cogs = sum(
+    shipping_total    = sum(shipping_map.values())
+    total_sales       = order_total_sales + shipping_total
+    total_fees        = sum(float(order.amazon_fees or 0) for order in orders)
+    total_cogs        = sum(
         float(item.cogs or 0)
         for order in orders
         for item in AmazonOrderItem.query.filter_by(amazon_order_id=order.amazon_order_id).all()
     )
     revenue = total_sales
-    roi = ((revenue - total_cogs - total_fees) / (total_cogs + total_fees + 1e-5)) * 100
+    roi     = ((revenue - total_cogs - total_fees) / (total_cogs + total_fees + 1e-5)) * 100
 
-    # 🔗 JOIN shipment events + order items
-    joined_data = db.session.query(
+    # ── Joined shipment events + order items ──────────────────────────────────
+    joined_q = db.session.query(
         AmazonFinancialShipmentEvent,
         AmazonOrderItem.asin,
         AmazonOrderItem.title,
@@ -841,28 +922,35 @@ def get_dashboard_data():
     ).outerjoin(
         AmazonOrderItem,
         (AmazonFinancialShipmentEvent.order_id == AmazonOrderItem.amazon_order_id) &
-        (AmazonFinancialShipmentEvent.sku == AmazonOrderItem.seller_sku)
+        (AmazonFinancialShipmentEvent.sku      == AmazonOrderItem.seller_sku)
     ).filter(
         AmazonFinancialShipmentEvent.selling_partner_id == selling_partner_id,
         AmazonFinancialShipmentEvent.posted_date.isnot(None)
-    ).all()
+    )
 
-    # 📦 Format joined results
+    if apply_marketplace_id_filter:
+        marketplace_name_normalized = MARKETPLACE_ID_TO_NAME.get(marketplace_id, "").strip()
+        if marketplace_name_normalized:
+            joined_q = joined_q.filter(AmazonFinancialShipmentEvent.marketplace == marketplace_name_normalized)
+    elif apply_marketplace_name_filter:
+        joined_q = joined_q.filter(AmazonFinancialShipmentEvent.marketplace == marketplace_name)
+
+    joined_data = joined_q.all()
+
     shipment_events = []
     for event, asin, title, cogs in joined_data:
         data = event.to_dict()
-        data["asin"] = asin
+        data["asin"]  = asin
         data["title"] = title
-        data["cogs"] = float(cogs) if cogs is not None else None
+        data["cogs"]  = float(cogs) if cogs is not None else None
         shipment_events.append(data)
 
-    # 🚀 Final response
     return jsonify({
         "cards": {
             "total_sales": round(total_sales, 2),
-            "revenue": round(revenue, 2),
-            "amazon_fees": round(total_fees, 2),
-            "roi": round(roi, 2)
+            "revenue":     round(revenue,    2),
+            "amazon_fees": round(total_fees,  2),
+            "roi":         round(roi,         2)
         },
         "orders": [
             {
@@ -873,7 +961,6 @@ def get_dashboard_data():
         ],
         "shipment_events": shipment_events
     })
-
 
 
 
@@ -1304,10 +1391,6 @@ def proxy_image(asin):
 
 
 
-    
-
-
-
 @app.route("/api/inventory", methods=["GET"])
 def get_inventory():
     selling_partner_id = request.args.get("selling_partner_id")
@@ -1328,67 +1411,98 @@ def get_inventory():
 
 
 
-
+from sqlalchemy import func, extract
+from datetime import datetime, timedelta
+from flask import request, jsonify
+from dateutil.relativedelta import relativedelta
 
 @app.route("/api/inventory-summary", methods=["GET"])
 def inventory_summary():
     seller = request.args.get("selling_partner_id")
+    marketplace_id = request.args.get("marketplace_id", "all")
+
     if not seller:
         return jsonify([]), 400
 
-    items = AmazonInventoryItem.query.\
-      filter_by(selling_partner_id=seller).all()
+    # Marketplace ID to readable name mapping
+    marketplace_name_map = {
+        "A1AM78C64UM0Y8": "Amazon.com.mx",
+        "ATVPDKIKX0DER": "Amazon.com",
+        # Add others if needed
+    }
+    marketplace_name = marketplace_name_map.get(marketplace_id)
 
-    cutoff = datetime.utcnow() - timedelta(days=30)
+    # Filter inventory items by seller and optional marketplace_id
+    item_query = AmazonInventoryItem.query.filter_by(selling_partner_id=seller)
+    if marketplace_id != "all":
+        item_query = item_query.filter_by(marketplace_id=marketplace_id)
+    items = item_query.all()
+
+    today = datetime.utcnow()
     out = []
 
     for inv in items:
-        # 1️⃣ Recent items for avg_30d_sales
-        recent = AmazonOrderItem.query.filter(
+        # Sales in the last 3 individual months
+        sales_by_month = []
+        for i in range(3):
+            month_start = (today.replace(day=1) - relativedelta(months=i)).replace(day=1)
+            month_end = month_start + relativedelta(months=1)
+
+            total = db.session.query(
+                db.func.sum(AmazonFinancialShipmentEvent.quantity)
+            ).filter(
+                AmazonFinancialShipmentEvent.selling_partner_id == seller,
+                AmazonFinancialShipmentEvent.sku == inv.sku,
+                AmazonFinancialShipmentEvent.posted_date >= month_start,
+                AmazonFinancialShipmentEvent.posted_date < month_end
+            ).scalar() or 0
+
+            if total > 0:
+                sales_by_month.append(total)
+
+        avg_monthly_sales = round(sum(sales_by_month) / len(sales_by_month), 2) if sales_by_month else 0
+
+        # Historic data for fallback unit price and COGS using ASIN instead of SKU
+        hist_query = AmazonOrderItem.query.filter(
             AmazonOrderItem.selling_partner_id == seller,
-            AmazonOrderItem.asin            == inv.asin,
-            AmazonOrderItem.purchase_date   >= cutoff
-        ).all()
+            AmazonOrderItem.asin == inv.asin
+        )
+        if marketplace_name:
+            hist_query = hist_query.filter(AmazonOrderItem.marketplace == marketplace_name)
 
-        total_qty   = sum(o.quantity_ordered or 0 for o in recent)
-        avg_30d     = round(total_qty / 30, 2)
+        all_hist = hist_query.all()
+        hist_cogs = [float(o.cogs or 0) for o in all_hist if o.cogs]
+        hist_prices = [float(o.item_price or 0) for o in all_hist if o.item_price]
 
-        # 2️⃣ Historic items for price/cogs fallback
-        all_hist = AmazonOrderItem.query.filter(
-            AmazonOrderItem.selling_partner_id == seller,
-            AmazonOrderItem.asin            == inv.asin
-        ).all()
+        avg_price = round(sum(hist_prices) / len(hist_prices), 2) if hist_prices else 0
+        avg_cogs = round(sum(hist_cogs) / len(hist_cogs), 2) if hist_cogs else 0
 
-        if all_hist:
-            avg_price = round(sum(float(o.item_price or 0) for o in all_hist) / len(all_hist), 2)
-            avg_cogs  = round(sum(float(o.cogs or 0)        for o in all_hist) / len(all_hist), 2)
-        else:
-            avg_price = avg_cogs = 0
+        # Get latest record for safety_stock and time_delivery
+        latest_order_item = hist_query.order_by(AmazonOrderItem.purchase_date.desc()).first()
+        safety_stock = latest_order_item.safety_stock if latest_order_item else 0
+        time_delivery = latest_order_item.time_delivery if latest_order_item else 0
 
         qty_avail = inv.quantity_available or 0
 
         out.append({
-            "asin":                   inv.asin,
-            "sku":                    inv.sku,
-            "name":                   inv.product_name,
-            "quantity_available":     qty_avail,
-            "avg_30d_sales":          avg_30d,
-            "unit_price":             avg_price,
-            "cogs":                   avg_cogs,
+            "asin": inv.asin,
+            "sku": inv.sku,
+            "name": inv.product_name,
+            "quantity_available": qty_avail,
+            "avg_monthly_sales": avg_monthly_sales,
+            "unit_price": avg_price,
+            "cogs": avg_cogs,
             "stock_value_unit_price": round(qty_avail * avg_price, 2),
-            "stock_value_cogs":       round(qty_avail * avg_cogs, 2),
-            "image_url": f"https://ws-na.amazon-adsystem.com/widgets/q?_encoding=UTF8&ASIN={inv.asin}&Format=_SL75_&ID=AsinImage"
-
+            "stock_value_cogs": round(qty_avail * avg_cogs, 2),
+            "safety_stock": safety_stock,
+            "time_delivery": time_delivery,
+            "image_url": (
+                f"https://ws-na.amazon-adsystem.com/widgets/q?_encoding=UTF8"
+                f"&ASIN={inv.asin}&Format=_SL75_&ID=AsinImage"
+            )
         })
 
     return jsonify(out)
-
-
-
-
-
-
-
 
 
 
@@ -1475,12 +1589,13 @@ def save_merged_inventory():
     try:
         selling_partner_id = request.args.get("selling_partner_id")
         access_token = request.args.get("access_token")
+        marketplace_id = request.args.get("marketplace_id")  # 👈 added
 
-        if not selling_partner_id or not access_token:
-            return {"error": "Missing selling_partner_id or access_token"}, 400
+        if not selling_partner_id or not access_token or not marketplace_id:
+            return {"error": "Missing selling_partner_id, access_token, or marketplace_id"}, 400
 
         from amazon_api import save_merged_inventory_report
-        save_merged_inventory_report(access_token, selling_partner_id)
+        save_merged_inventory_report(access_token, selling_partner_id, marketplace_id)  # 👈 pass it to function
         return {"message": "✅ Inventory merged and saved successfully!"}
 
     except Exception as e:
@@ -1676,38 +1791,101 @@ def return_rate_summary():
 
 
 
-
 @app.route("/api/inventory-planner", methods=["GET"])
 def get_inventory_planner_data():
+    from sqlalchemy import func
+    from datetime import datetime
+    from dateutil.relativedelta import relativedelta
+
+    # Query params
     selling_partner_id = request.args.get("selling_partner_id")
+    marketplace_param = request.args.get("marketplace", "all")
+
+    # Map IDs to names
+    marketplace_name_map = {
+        "A1AM78C64UM0Y8": "Amazon.com.mx",
+        "ATVPDKIKX0DER": "Amazon.com",
+        "APJ6JRA9NG5V4": "Amazon.ca",
+    }
+    reverse_map = {v: k for k, v in marketplace_name_map.items()}
+
+    # Normalize marketplace input to readable name
+    if marketplace_param == "all":
+        marketplace = "all"
+    elif marketplace_param in marketplace_name_map:
+        marketplace = marketplace_name_map[marketplace_param]
+    elif marketplace_param in reverse_map:
+        marketplace = marketplace_param  # already a readable name
+    else:
+        marketplace = "all"  # fallback
+
     if not selling_partner_id:
         return jsonify({"error": "Missing selling_partner_id"}), 400
 
-    # Get all inventory items
-    inventory_items = AmazonInventoryItem.query.filter_by(selling_partner_id=selling_partner_id).all()
+    # 1) Inventory items
+    inv_q = AmazonInventoryItem.query.filter_by(selling_partner_id=selling_partner_id)
+    if marketplace != "all":
+        inv_q = inv_q.filter_by(marketplace_id=reverse_map.get(marketplace, marketplace))  # use ID
+    inventory_items = inv_q.all()
 
-    # Get ASIN-level sales from last 30 days
-    one_month_ago = datetime.utcnow() - timedelta(days=30)
-    sales_data = db.session.query(
-        AmazonOrderItem.asin,
-        db.func.sum(AmazonOrderItem.quantity_shipped).label("total_units")
-    ).filter(
-        AmazonOrderItem.selling_partner_id == selling_partner_id,
-        AmazonOrderItem.purchase_date >= one_month_ago
-    ).group_by(AmazonOrderItem.asin).all()
+    # 2) Avg monthly sales from shipment events
+    sales_map = {}
+    today = datetime.utcnow()
+    for item in inventory_items:
+        if not item.asin:
+            continue
+        sales_by_month = []
+        for i in range(3):
+            month_start = (today.replace(day=1) - relativedelta(months=i)).replace(day=1)
+            month_end = month_start + relativedelta(months=1)
+            total_query = db.session.query(
+                func.sum(AmazonFinancialShipmentEvent.quantity)
+            ).filter(
+                AmazonFinancialShipmentEvent.selling_partner_id == selling_partner_id,
+                AmazonFinancialShipmentEvent.sku == item.sku,
+                AmazonFinancialShipmentEvent.posted_date >= month_start,
+                AmazonFinancialShipmentEvent.posted_date < month_end
+            )
+            if marketplace != "all":
+                total_query = total_query.filter(
+                    AmazonFinancialShipmentEvent.marketplace == marketplace
+                )
+            total = total_query.scalar() or 0
+            if total > 0:
+                sales_by_month.append(total)
 
-    sales_map = {asin: total_units / 30 for asin, total_units in sales_data if asin}
+        avg_monthly = round(sum(sales_by_month) / len(sales_by_month), 2) if sales_by_month else 0
+        sales_map[item.asin] = avg_monthly
 
+    # 3) Build planner output
     results = []
     for item in inventory_items:
         if not item.asin:
             continue
+        oi_q = AmazonOrderItem.query.filter_by(
+            selling_partner_id=selling_partner_id,
+            asin=item.asin
+        )
+        if marketplace != "all":
+            oi_q = oi_q.filter(AmazonOrderItem.marketplace == marketplace)
+        oi = oi_q.order_by(AmazonOrderItem.purchase_date.desc()).first()
+
+        safety_stock = oi.safety_stock if oi and oi.safety_stock is not None else 0
+        time_delivery = oi.time_delivery if oi and oi.time_delivery is not None else 0
+        qty_avail = item.quantity_available or 0
+        avg_sales = sales_map.get(item.asin, 0)
+
+        daily_sales = (avg_sales / 30) or 0.01
+        coverage_days = int(qty_avail / daily_sales)
+
         results.append({
             "asin": item.asin,
             "title": item.product_name or "Untitled",
-            "quantity_available": item.quantity_available or 0,
-            "avg_30d_sales": round(sales_map.get(item.asin, 0), 2),
-            "delivery_eta_days": 30  # static or calculated later
+            "quantity_available": qty_avail,
+            "avg_monthly_sales": avg_sales,
+            "safety_stock": safety_stock,
+            "time_delivery": time_delivery,
+            "coverage_days": coverage_days
         })
 
     return jsonify(results)

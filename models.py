@@ -107,31 +107,42 @@ class AmazonSettlementData(db.Model):
         }
     
 
+
+
 class AmazonOrderItem(db.Model):
     __tablename__ = 'amazon_order_items'
 
-    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    selling_partner_id = db.Column(db.String, db.ForeignKey("amazon_oauth_tokens.selling_partner_id"), nullable=False)
-    amazon_order_id = db.Column(db.String, db.ForeignKey("amazon_orders.amazon_order_id"), nullable=False)
-    order_item_id = db.Column(db.String, unique=True, nullable=False)
-    asin = db.Column(db.String(20), nullable=True)
-    title = db.Column(db.Text, nullable=True)
-    seller_sku = db.Column(db.String(50), nullable=True)
-    condition = db.Column(db.String(20), nullable=True)
-    is_gift = db.Column(db.Boolean, default=False)
-    quantity_ordered = db.Column(db.Integer, nullable=True)
-    quantity_shipped = db.Column(db.Integer, nullable=True)
-    item_price = db.Column(db.Numeric(10, 2), nullable=True, default=0)
-    item_tax = db.Column(db.Numeric(10, 2), nullable=True, default=0)
-    shipping_price = db.Column(db.Numeric(10, 2), nullable=True, default=0)
-    shipping_tax = db.Column(db.Numeric(10, 2), nullable=True, default=0)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    cogs = db.Column(db.Numeric(10, 2), nullable=True, default=0)
-    purchase_date = db.Column(db.DateTime, nullable=True)
-    image_url = db.Column(db.Text)
-    marketplace = db.Column(db.String(50), nullable=True)
-    safety_stock = db.Column(db.Integer, nullable=True)
-
+    id                  = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    selling_partner_id  = db.Column(
+        db.String, 
+        db.ForeignKey("amazon_oauth_tokens.selling_partner_id"), 
+        nullable=False
+    )
+    amazon_order_id     = db.Column(
+        db.String, 
+        db.ForeignKey("amazon_orders.amazon_order_id"), 
+        nullable=False
+    )
+    order_item_id       = db.Column(db.String, unique=True, nullable=False)
+    asin                = db.Column(db.String(20), nullable=True)
+    title               = db.Column(db.Text, nullable=True)
+    seller_sku          = db.Column(db.String(50), nullable=True)
+    condition           = db.Column(db.String(20), nullable=True)
+    is_gift             = db.Column(db.Boolean, default=False)
+    quantity_ordered    = db.Column(db.Integer, nullable=True)
+    quantity_shipped    = db.Column(db.Integer, nullable=True)
+    item_price          = db.Column(db.Numeric(10, 2), nullable=True, default=0)
+    item_tax            = db.Column(db.Numeric(10, 2), nullable=True, default=0)
+    shipping_price      = db.Column(db.Numeric(10, 2), nullable=True, default=0)
+    shipping_tax        = db.Column(db.Numeric(10, 2), nullable=True, default=0)
+    created_at          = db.Column(db.DateTime, default=datetime.utcnow)
+    cogs                = db.Column(db.Numeric(10, 2), nullable=True, default=0)
+    purchase_date       = db.Column(db.DateTime, nullable=True)
+    image_url           = db.Column(db.Text)
+    marketplace         = db.Column(db.String(50), nullable=True)
+    safety_stock        = db.Column(db.Integer, nullable=True, default=0)
+    time_delivery       = db.Column(db.Integer, nullable=True, default=0)   # ← added
+    marketplace_id = db.Column(db.String(50), nullable=True)
 
 
     def to_dict(self):
@@ -147,17 +158,22 @@ class AmazonOrderItem(db.Model):
             "is_gift": self.is_gift,
             "quantity_ordered": self.quantity_ordered,
             "quantity_shipped": self.quantity_shipped,
-            "item_price": float(self.item_price) if self.item_price else None,
-            "item_tax": float(self.item_tax) if self.item_tax else None,
-            "shipping_price": float(self.shipping_price) if self.shipping_price else None,
-            "shipping_tax": float(self.shipping_tax) if self.shipping_tax else None,
+            "item_price": float(self.item_price or 0),
+            "item_tax": float(self.item_tax or 0),
+            "shipping_price": float(self.shipping_price or 0),
+            "shipping_tax": float(self.shipping_tax or 0),
             "created_at": self.created_at.strftime('%Y-%m-%d %H:%M:%S'),
-            "cogs": self.cogs,
-            "purchase_date" : self.purchase_date.strftime('%Y-%m-%d %H:%M:%S') if self.purchase_date else None,
+            "cogs": float(self.cogs or 0),               # convert to float
+            "purchase_date": (
+                self.purchase_date.strftime('%Y-%m-%d %H:%M:%S')
+                if self.purchase_date else None
+            ),
             "image_url": self.image_url,
             "marketplace": self.marketplace,
-            "safety_stock": self.safety_stock
+            "safety_stock": self.safety_stock or 0,
+            "time_delivery": self.time_delivery or 0        # include new field
         }
+
 
 
 
@@ -226,6 +242,7 @@ class AmazonInventoryItem(db.Model):
     price = db.Column(db.String, nullable=True)  # for "price"
     inventory_status = db.Column(db.String, nullable=True)  # for "status"
     image_url = db.Column(db.String, nullable=True)  # for "image_url"
+    marketplace_id = db.Column(db.String, nullable=True)  # ✅ Add this
     
 
 

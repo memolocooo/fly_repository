@@ -26,7 +26,7 @@ import os
 
 
 
-def fetch_orders_from_amazon(selling_partner_id, access_token, created_after):
+def fetch_orders_from_amazon(selling_partner_id, access_token, created_after, marketplace_id):
     url = "https://sellingpartnerapi-na.amazon.com/orders/v0/orders"
 
     headers = {
@@ -1277,7 +1277,7 @@ def fetch_main_image_from_catalog(asin, access_token):
 
 
 
-def save_merged_inventory_report(access_token, selling_partner_id):
+def save_merged_inventory_report(access_token, selling_partner_id, marketplace_id):
     try:
         print(f"📥 Merging inventory reports for {selling_partner_id}...")
 
@@ -1351,7 +1351,8 @@ def save_merged_inventory_report(access_token, selling_partner_id):
                     price=row.get("price"),
                     quantity_available=quantity_available,
                     image_url=image_url,
-                    last_updated=datetime.utcnow()
+                    last_updated=datetime.utcnow(),
+                    marketplace_id=marketplace_id
                 )
                 db.session.add(item)
                 items_saved += 1
