@@ -778,7 +778,7 @@ def get_all_order_items():
 @app.route("/api/order-items", methods=["GET"])
 def get_order_items_for_dashboard():
     selling_partner_id = request.args.get("selling_partner_id")
-    marketplace_id = request.args.get("marketplace_id")  # ← get the ID
+    marketplace_id = request.args.get("marketplace_id")
     if not selling_partner_id:
         return jsonify({"error": "Missing selling_partner_id"}), 400
 
@@ -795,8 +795,11 @@ def get_order_items_for_dashboard():
         query = query.filter_by(marketplace=marketplace_name)
 
     items = query.all()
-    seen_asins = set()
-    unique_items = []
+
+    from collections import defaultdict
+    items_by_asin = defaultdict(list)
+    for item in items:
+        items_by_asin[item.asin].append(item)
 
     def compute_margin(item):
         cogs = float(item.cogs or 0)
@@ -804,29 +807,30 @@ def get_order_items_for_dashboard():
         revenue = float(item.item_price or 0) + float(item.shipping_price or 0)
         return round(revenue - (cogs + fees), 2)
 
-    for item in items:
-        if item.asin not in seen_asins:
-            seen_asins.add(item.asin)
-            unique_items.append({
-    "order_item_id": item.order_item_id,
-    "title": item.title,
-    "seller_sku": item.seller_sku,
-    "asin": item.asin,
-    "item_price": float(item.item_price or 0),
-    "shipping_price": float(item.shipping_price or 0),
-    "amazon_fees": float(item.item_tax or 0) + float(item.shipping_tax or 0),
-    "cogs": float(item.cogs or 0),
-    "safety_stock": int(item.safety_stock or 0),
-    "time_delivery": int(item.time_delivery or 0),
-    "margin": compute_margin(item),
-    "image_url": item.image_url or f"https://render-webflow-restless-river-7629.fly.dev/images/{item.asin}.jpg",
-    "marketplace": item.marketplace or "Unknown"
-})
-
+    unique_items = []
+    for asin, asin_items in items_by_asin.items():
+        # Prefer row with a non-null, non-empty, non-dash title, else fallback to first entry
+        preferred = next(
+            (i for i in asin_items if i.title and str(i.title).strip() and str(i.title).strip() != "-"),
+            asin_items[0]
+        )
+        unique_items.append({
+            "order_item_id": preferred.order_item_id,
+            "title": preferred.title,
+            "seller_sku": preferred.seller_sku,
+            "asin": preferred.asin,
+            "item_price": float(preferred.item_price or 0),
+            "shipping_price": float(preferred.shipping_price or 0),
+            "amazon_fees": float(preferred.item_tax or 0) + float(preferred.shipping_tax or 0),
+            "cogs": float(preferred.cogs or 0),
+            "safety_stock": int(preferred.safety_stock or 0),
+            "time_delivery": int(preferred.time_delivery or 0),
+            "margin": compute_margin(preferred),
+            "image_url": preferred.image_url or f"https://render-webflow-restless-river-7629.fly.dev/images/{preferred.asin}.jpg",
+            "marketplace": preferred.marketplace or "Unknown"
+        })
 
     return jsonify(unique_items)
-
-
 
 
 
@@ -1790,7 +1794,6 @@ def return_rate_summary():
     })
 
 
-
 @app.route("/api/inventory-planner", methods=["GET"])
 def get_inventory_planner_data():
     from sqlalchemy import func
@@ -1799,7 +1802,7 @@ def get_inventory_planner_data():
 
     # Query params
     selling_partner_id = request.args.get("selling_partner_id")
-    marketplace_param = request.args.get("marketplace", "all")
+    marketplace_param  = request.args.get("marketplace", "all")
 
     # Map IDs to names
     marketplace_name_map = {
@@ -1825,7 +1828,7 @@ def get_inventory_planner_data():
     # 1) Inventory items
     inv_q = AmazonInventoryItem.query.filter_by(selling_partner_id=selling_partner_id)
     if marketplace != "all":
-        inv_q = inv_q.filter_by(marketplace_id=reverse_map.get(marketplace, marketplace))  # use ID
+        inv_q = inv_q.filter_by(marketplace_id=reverse_map.get(marketplace, marketplace))
     inventory_items = inv_q.all()
 
     # 2) Avg monthly sales from shipment events
@@ -1837,7 +1840,7 @@ def get_inventory_planner_data():
         sales_by_month = []
         for i in range(3):
             month_start = (today.replace(day=1) - relativedelta(months=i)).replace(day=1)
-            month_end = month_start + relativedelta(months=1)
+            month_end   = month_start + relativedelta(months=1)
             total_query = db.session.query(
                 func.sum(AmazonFinancialShipmentEvent.quantity)
             ).filter(
@@ -1870,22 +1873,27 @@ def get_inventory_planner_data():
             oi_q = oi_q.filter(AmazonOrderItem.marketplace == marketplace)
         oi = oi_q.order_by(AmazonOrderItem.purchase_date.desc()).first()
 
-        safety_stock = oi.safety_stock if oi and oi.safety_stock is not None else 0
+        safety_stock  = oi.safety_stock if oi and oi.safety_stock is not None else 0
         time_delivery = oi.time_delivery if oi and oi.time_delivery is not None else 0
-        qty_avail = item.quantity_available or 0
-        avg_sales = sales_map.get(item.asin, 0)
+        qty_avail     = item.quantity_available or 0
+        avg_sales     = sales_map.get(item.asin, 0)
 
-        daily_sales = (avg_sales / 30) or 0.01
+        daily_sales   = (avg_sales / 30) or 0.01
         coverage_days = int(qty_avail / daily_sales)
 
+        # compute numeric reorder index
+        days_to_reorder = max(0,  time_delivery + safety_stock)
+
         results.append({
-            "asin": item.asin,
-            "title": item.product_name or "Untitled",
+            "asin":               item.asin,
+            "title":              item.product_name or "Untitled",
             "quantity_available": qty_avail,
-            "avg_monthly_sales": avg_sales,
-            "safety_stock": safety_stock,
-            "time_delivery": time_delivery,
-            "coverage_days": coverage_days
+            "avg_monthly_sales":  avg_sales,
+            "safety_stock":       safety_stock,
+            "time_delivery":      time_delivery,
+            "coverage_days":      coverage_days,
+            "order_by_day":       days_to_reorder
         })
 
     return jsonify(results)
+
