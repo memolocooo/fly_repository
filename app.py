@@ -1741,6 +1741,7 @@ def view_fba_financial_events():
 
 
 
+
 @app.route("/api/return-rate-summary", methods=["GET"])
 def return_rate_summary():
     from models import AmazonOrderItem, AmazonFinancialShipmentEvent
@@ -1752,14 +1753,20 @@ def return_rate_summary():
     if not selling_partner_id:
         return jsonify({"error": "Missing selling_partner_id"}), 400
 
+    # Optionally: add ASIN filter support from query param
+    asin_filters = request.args.getlist("asin")  # e.g., ?asin=B0D4QPKZ4K&asin=NEWASIN123456
+
     today = datetime.utcnow()
     twelve_months_ago = today - timedelta(days=365)
 
-    order_items = AmazonOrderItem.query.filter(
+    order_items_query = AmazonOrderItem.query.filter(
         AmazonOrderItem.selling_partner_id == selling_partner_id,
         AmazonOrderItem.purchase_date != None,
         AmazonOrderItem.purchase_date >= twelve_months_ago
-    ).all()
+    )
+    if asin_filters:
+        order_items_query = order_items_query.filter(AmazonOrderItem.asin.in_(asin_filters))
+    order_items = order_items_query.all()
 
     refund_events = AmazonFinancialShipmentEvent.query.filter(
         AmazonFinancialShipmentEvent.selling_partner_id == selling_partner_id,
@@ -1768,17 +1775,29 @@ def return_rate_summary():
 
     refunded_order_ids = set(e.order_id for e in refund_events if e.order_id)
 
+    # For new per-ASIN monthly returns and orders
+    items_by_month = defaultdict(lambda: defaultdict(int))    # {month: {asin: return_count}}
+    orders_by_month = defaultdict(lambda: defaultdict(int))   # {month: {asin: order_count}}
+
     month_data = defaultdict(lambda: {"orders": 0, "returns": 0})
 
     for item in order_items:
         month = item.purchase_date.strftime("%Y-%m")
         month_data[month]["orders"] += 1
+        if item.asin:
+            orders_by_month[month][item.asin] += 1
         if item.amazon_order_id in refunded_order_ids:
             month_data[month]["returns"] += 1
+            if item.asin:
+                items_by_month[month][item.asin] += 1
 
     total_returns = sum(d["returns"] for d in month_data.values())
     total_orders = sum(d["orders"] for d in month_data.values())
     overall_rate = round((total_returns / total_orders) * 100, 1) if total_orders else 0
+
+    # Convert defaultdicts to dicts for JSON serialization
+    items_by_month_dict = {month: dict(asins) for month, asins in items_by_month.items()}
+    orders_by_month_dict = {month: dict(asins) for month, asins in orders_by_month.items()}
 
     return jsonify({
         "total_returns": total_returns,
@@ -1790,8 +1809,11 @@ def return_rate_summary():
         "monthly_return_rates": {
             month: round((d["returns"] / d["orders"]) * 100, 1) if d["orders"] else 0
             for month, d in sorted(month_data.items())
-        }
+        },
+        "items_by_month": items_by_month_dict,    # <-- Per-ASIN returns per month
+        "orders_by_month": orders_by_month_dict   # <-- Per-ASIN orders per month
     })
+
 
 
 @app.route("/api/inventory-planner", methods=["GET"])
@@ -1897,3 +1919,76 @@ def get_inventory_planner_data():
 
     return jsonify(results)
 
+
+
+
+@app.route("/api/pnl-summary", methods=["GET"])
+def pnl_summary():
+    from sqlalchemy import func
+
+    # Query params
+    selling_partner_id = request.args.get("selling_partner_id")
+    marketplace_param  = request.args.get("marketplace_id", "all")
+
+    # Map IDs to names
+    marketplace_name_map = {
+        "A1AM78C64UM0Y8": "Amazon.com.mx",
+        "ATVPDKIKX0DER": "Amazon.com",
+        "APJ6JRA9NG5V4": "Amazon.ca",
+    }
+    reverse_map = {v: k for k, v in marketplace_name_map.items()}
+
+    # Normalize marketplace input to ID
+    if marketplace_param == "all":
+        marketplace_id = None
+    elif marketplace_param in marketplace_name_map:
+        marketplace_id = marketplace_param
+    elif marketplace_param in reverse_map:  # just in case user passes readable name
+        marketplace_id = reverse_map[marketplace_param]
+    else:
+        marketplace_id = None
+
+    if not selling_partner_id:
+        return jsonify({"error": "Missing selling_partner_id"}), 400
+
+    # Build base query
+    query = (
+        db.session.query(
+            func.to_char(AmazonOrders.purchase_date, 'YYYY-MM').label('month'),
+            func.sum(AmazonOrders.total_amount).label('revenue'),
+            func.sum(AmazonOrderItem.cogs).label('cogs'),
+            func.sum(AmazonFinancialShipmentEvent.fba_fee + AmazonFinancialShipmentEvent.commission).label('amazon_fees'),
+            func.sum(AmazonFinancialShipmentEvent.refund_fee).label('returns'),
+            func.sum(AmazonFinancialShipmentEvent.ads_fee).label('ads_fees'),
+            func.sum(AmazonFinancialShipmentEvent.service_fee).label('service_fees'),
+            func.sum(AmazonFinancialShipmentEvent.storage_fee).label('storage_fees'),
+        )
+        .join(AmazonOrderItem, AmazonOrderItem.amazon_order_id == AmazonOrders.amazon_order_id)
+        .join(AmazonFinancialShipmentEvent, AmazonFinancialShipmentEvent.order_id == AmazonOrders.amazon_order_id)
+        .filter(AmazonOrders.selling_partner_id == selling_partner_id)
+    )
+
+    if marketplace_id:  # Only filter if not "all"
+        query = query.filter(AmazonOrders.marketplace_id == marketplace_id)
+
+    query = query.group_by('month').order_by('month')
+
+    monthly_stats = query.all()
+
+    result = []
+    for row in monthly_stats:
+        net_profit = (row.revenue or 0) - (row.cogs or 0) - (row.amazon_fees or 0) - (row.returns or 0) - (row.ads_fees or 0) - (row.service_fees or 0) - (row.storage_fees or 0)
+        profit_margin = (net_profit / (row.revenue or 1)) * 100 if row.revenue else 0
+        result.append({
+            "month": row.month,
+            "revenue": float(row.revenue or 0),
+            "cogs": float(row.cogs or 0),
+            "amazon_fees": float(row.amazon_fees or 0),
+            "returns": float(row.returns or 0),
+            "ads_fees": float(row.ads_fees or 0),
+            "service_fees": float(row.service_fees or 0),
+            "storage_fees": float(row.storage_fees or 0),
+            "net_profit": float(net_profit),
+            "profit_margin": round(profit_margin, 2)
+        })
+    return jsonify(result)
